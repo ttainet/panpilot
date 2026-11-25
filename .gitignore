@@ -6,3 +6,5 @@ node_modules/
 scripts/deploy-state.json
 dist/
 *.log
+
+__pycache__/
