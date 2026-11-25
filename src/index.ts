@@ -38,7 +38,26 @@
  * configured TMDB API key so a Driver needs no credentials of its own:
  * without a valid key, every Driver endpoint answers 401 and no data
  * (subscriptions, cookie, TMDB key, channels) can be read at all.
+ *
+ * v0.7: library directory layout becomes a first-class setting
+ * (settings key `directories`, defaults in directories.ts mirroring the
+ * owner's real Quark structure: 电视剧/电影 under 电影电视剧, JP+KR merged
+ * into 日韩剧, 国漫/纪录片/综艺 under 电视剧, movies split 华语/外语/动画).
+ * The settings page edits it, GET /api/driver/config returns the effective
+ * value, and TMDB region classification follows the same maps (no more
+ * hard-coded JP→日剧/KR→韩剧). This version also ships the AI Driver
+ * operating guide in three synced places: docs/AI_DRIVER_GUIDE.md (source),
+ * AGENTS.md (concise), and GET /api/driver/agent-guide (served from
+ * guide.ts, generated from the doc by scripts/gen-guide.mjs).
  */
+
+import {
+  regionForMedia,
+  resolveDirectories,
+  validateDirectories,
+  type DirectorySettings,
+} from "./directories";
+import { AI_DRIVER_GUIDE_MD } from "./guide";
 
 import { DEFAULT_TG_CHANNELS, PRIORITY_TG_CHANNELS } from "./channels";
 
@@ -68,7 +87,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -1365,6 +1384,8 @@ async function handleGetSettings(store: Store, env: Env): Promise<Response> {
   const auth = await getEffectiveAuth(env, store);
   const cookieMeta = await getQuarkCookieMeta(store, env);
   const eff = await getEffectiveChannels(store);
+  const directories = await getEffectiveDirectories(store);
+  const directoriesCustom = (await store.getSetting(SETTING_DIRECTORIES)) != null;
   return json({
     settings: {
       tmdb_api_key: { configured: !!key, masked: key ? maskKey(key) : null },
@@ -1390,6 +1411,9 @@ async function handleGetSettings(store: Store, env: Env): Promise<Response> {
         // The effective list is what the settings textarea shows/edits.
         effective: eff.channels,
       },
+      // v0.7: effective library directory layout (defaults when not customised).
+      directories,
+      directories_custom: directoriesCustom,
     },
   });
 }
@@ -1463,9 +1487,20 @@ async function handleUpdateSettings(req: Request, store: Store, env: Env): Promi
     tg_channels?: unknown;
     reset_tg_channels?: boolean;
     tg_channels_priority_only?: boolean;
+    directories?: unknown;
+    reset_directories?: boolean;
   }>(req);
   if (!input) return err("bad_request", "invalid JSON body", 400);
   let changed = false;
+
+  // --- Library directories (v0.7): validate up-front so a bad object
+  // cannot leave the other settings half-applied. ---
+  let directoriesToSave: DirectorySettings | null = null;
+  if (input.directories !== undefined) {
+    const v = validateDirectories(input.directories);
+    if (!v.value) return err("bad_request", `入库目录设置不合法：${v.error ?? "unknown error"}`, 400);
+    directoriesToSave = v.value;
+  }
 
   if (input.clear_tmdb_api_key) {
     await store.deleteSetting(SETTING_TMDB_API_KEY);
@@ -1529,8 +1564,22 @@ async function handleUpdateSettings(req: Request, store: Store, env: Env): Promi
     changed = true;
   }
 
+  // --- Library directories (v0.7): save the validated object / reset. ---
+  if (input.reset_directories) {
+    await store.deleteSetting(SETTING_DIRECTORIES);
+    await store.addLog({ level: "info", event: "directories_reset" });
+    changed = true;
+  } else if (directoriesToSave) {
+    await store.setSetting(SETTING_DIRECTORIES, JSON.stringify(directoriesToSave));
+    await store.addLog({
+      level: "info", event: "directories_saved",
+      detail: JSON.stringify({ base_dir: directoriesToSave.base_dir }),
+    });
+    changed = true;
+  }
+
   if (!changed) {
-    return err("bad_request", "nothing to update: provide tmdb_api_key / quark_cookie / tg_channels / tg_channels_priority_only (or the clear/reset flags)", 400);
+    return err("bad_request", "nothing to update: provide tmdb_api_key / quark_cookie / tg_channels / tg_channels_priority_only / directories (or the clear/reset flags)", 400);
   }
   return handleGetSettings(store, env);
 }
@@ -1688,6 +1737,13 @@ async function getEffectiveChannels(store: Store): Promise<EffectiveChannels> {
   return { channels: base, custom, priority_only: true, priority_fallback: true };
 }
 
+const SETTING_DIRECTORIES = "directories"; // JSON DirectorySettings; absent = DEFAULT_DIRECTORIES (v0.7)
+
+/** Effective library directory settings: stored JSON merged over the defaults. */
+async function getEffectiveDirectories(store: Store): Promise<DirectorySettings> {
+  return resolveDirectories(await store.getSetting(SETTING_DIRECTORIES));
+}
+
 /** GET /api/driver/config — everything a Driver needs for a round. No-store. */
 async function handleDriverConfig(store: Store, env: Env): Promise<Response> {
   const cookie = await getQuarkCookiePlaintext(store, env);
@@ -1695,6 +1751,9 @@ async function handleDriverConfig(store: Store, env: Env): Promise<Response> {
   // no credentials of its own beyond its PanPilot API key.
   const tmdbKey = await getTmdbApiKey(store);
   const eff = await getEffectiveChannels(store);
+  // v0.7: the effective library directory layout ships with the config so
+  // the Driver files into the user's real Quark structure (see guide §5).
+  const directories = await getEffectiveDirectories(store);
   await store.addLog({
     level: "info", event: "driver_config_fetched",
     detail: JSON.stringify({
@@ -1710,9 +1769,22 @@ async function handleDriverConfig(store: Store, env: Env): Promise<Response> {
       tg_channels_priority_only: eff.priority_only,
       tg_channels_priority_fallback: eff.priority_fallback,
       check_interval_hours: checkIntervalSeconds(env) / 3600,
+      directories,
     }),
     { status: 200, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } },
   );
+}
+
+/**
+ * GET /api/driver/agent-guide — the AI Driver operating guide as Markdown.
+ * The text is generated from docs/AI_DRIVER_GUIDE.md into guide.ts (see
+ * scripts/gen-guide.mjs); AGENTS.md at the repo root is its concise twin.
+ */
+function handleDriverAgentGuide(): Response {
+  return new Response(AI_DRIVER_GUIDE_MD, {
+    status: 200,
+    headers: { "content-type": "text/markdown; charset=utf-8", "cache-control": "no-store" },
+  });
 }
 
 /** POST /api/driver/quark-status — Driver reports whether the cookie still works. */
@@ -1736,26 +1808,15 @@ async function handleDriverQuarkStatus(req: Request, store: Store): Promise<Resp
 // TMDB (web API) — MoviePilot-style: subscriptions bind to a TMDB id
 // ---------------------------------------------------------------------------
 
-/** Map TMDB origin country to the user's library region categories (DESIGN.md §3). */
-function mapRegion(country: string | undefined, mediaType: MediaType): string {
-  const c = (country ?? "").toUpperCase();
-  if (mediaType === "movie") {
-    switch (c) {
-      case "CN": return "国产电影";
-      case "HK": case "TW": return "港台电影";
-      case "JP": return "日本电影";
-      case "KR": return "韩国电影";
-      default: return "欧美电影";
-    }
-  }
-  switch (c) {
-    case "CN": return "国产剧";
-    case "HK": case "TW": return "港台剧";
-    case "JP": return "日剧";
-    case "KR": return "韩剧";
-    default: return "欧美剧";
-  }
-}
+/**
+ * Map a TMDB title to the user's library category folder. Since v0.7 this
+ * follows the `directories` settings maps (regionForMedia in directories.ts),
+ * NOT a hard-coded table: with the defaults, JP/KR both map to 日韩剧,
+ * CN/HK/TW to 国产剧, Chinese animation to 国漫, documentaries to 纪录片,
+ * reality/talk to 综艺, movies to 华语电影/动画电影/外语电影 — matching the
+ * owner's real Quark layout. Classification is therefore user-editable on
+ * the settings page ("分类以 directories 设置为准").
+ */
 
 interface TmdbFetchResult { data?: unknown; errorResponse?: Response }
 
@@ -1793,6 +1854,7 @@ async function handleTmdbSearch(url: URL, store: Store): Promise<Response> {
   if (!q) return err("bad_request", "q is required", 400);
   const { data, errorResponse } = await tmdbFetch(store, `/search/multi?query=${encodeURIComponent(q)}&include_adult=false&page=1`);
   if (errorResponse) return errorResponse;
+  const dirs = await getEffectiveDirectories(store);
   const results = ((data as { results?: unknown[] }).results ?? [])
     .filter((r): r is Row => typeof r === "object" && r !== null && (r as Row).media_type !== "person"
       && ((r as Row).media_type === "tv" || (r as Row).media_type === "movie"))
@@ -1800,6 +1862,7 @@ async function handleTmdbSearch(url: URL, store: Store): Promise<Response> {
       const mediaType = String(r.media_type) as MediaType;
       const dateStr = String((mediaType === "tv" ? r.first_air_date : r.release_date) ?? "");
       const countries = Array.isArray(r.origin_country) ? (r.origin_country as unknown[]).map(String) : [];
+      const genreIds = Array.isArray(r.genre_ids) ? (r.genre_ids as unknown[]).map(Number).filter(Number.isFinite) : [];
       return {
         tmdb_id: Number(r.id),
         media_type: mediaType,
@@ -1807,7 +1870,7 @@ async function handleTmdbSearch(url: URL, store: Store): Promise<Response> {
         original_title: String((mediaType === "tv" ? r.original_name : r.original_title) ?? ""),
         year: dateStr ? Number(dateStr.slice(0, 4)) : undefined,
         origin_country: countries,
-        region: mapRegion(countries[0], mediaType),
+        region: regionForMedia(dirs, countries[0], mediaType, genreIds),
         poster_url: tmdbPoster(r.poster_path),
         poster_path: typeof r.poster_path === "string" && r.poster_path ? r.poster_path : undefined,
         rating: typeof r.vote_average === "number" ? r.vote_average : undefined,
@@ -1829,9 +1892,10 @@ async function handleTmdbDetails(url: URL, store: Store): Promise<Response> {
   const r = data as Row;
   const countries = Array.isArray(r.origin_country) ? (r.origin_country as unknown[]).map(String) : [];
   const dateStr = String((type === "tv" ? r.first_air_date : r.release_date) ?? "");
-  const genres = Array.isArray(r.genres)
-    ? (r.genres as Row[]).map((g) => String(g.name)).filter(Boolean)
-    : [];
+  const genreRows = Array.isArray(r.genres) ? (r.genres as Row[]) : [];
+  const genres = genreRows.map((g) => String(g.name)).filter(Boolean);
+  const genreIds = genreRows.map((g) => Number(g.id)).filter(Number.isFinite);
+  const dirs = await getEffectiveDirectories(store);
   const base = {
     tmdb_id: Number(r.id),
     media_type: type as MediaType,
@@ -1839,7 +1903,7 @@ async function handleTmdbDetails(url: URL, store: Store): Promise<Response> {
     original_title: String((type === "tv" ? r.original_name : r.original_title) ?? ""),
     year: dateStr ? Number(dateStr.slice(0, 4)) : undefined,
     origin_country: countries,
-    region: mapRegion(countries[0], type as MediaType),
+    region: regionForMedia(dirs, countries[0], type as MediaType, genreIds),
     genres,
     poster_url: tmdbPoster(r.poster_path),
     poster_path: typeof r.poster_path === "string" && r.poster_path ? r.poster_path : undefined,
@@ -2286,6 +2350,36 @@ function appHtml(initialView: string): string {
           </form>
           <p id="channels-msg" class="muted"></p>
         </div>
+        <div class="card" id="card-directories">
+          <h2>入库目录</h2>
+          <p class="muted">Driver 转存入库时使用的网盘目录规范，分类判定以这里的映射为准（Driver 每轮从配置接口读取生效值）。默认值按夸克实际结构预填：电视剧与电影都在根目录下，日韩合并为「日韩剧」，国漫/纪录片/综艺都在电视剧下，电影分华语/外语/动画。映射一行一条，格式「代码=文件夹名」：地区代码为 TMDB 原产地代码（CN/JP/KR 等），* 表示其他地区；电影映射里 animation 表示动画电影；电视剧特殊分类的键为 animation_cn（国漫）/ documentary（纪录片）/ variety（综艺）。模板占位符：{title} {year} {season} {episode}，:02 表示两位零填充。</p>
+          <p>当前状态：<span id="directories-status">加载中…</span></p>
+          <form id="directories-form">
+            <div style="display:flex;flex-wrap:wrap;gap:.55rem;align-items:center">
+              <label class="muted">根目录 <input id="dir-base" style="width:150px"></label>
+              <label class="muted">电视剧目录 <input id="dir-tv" style="width:110px"></label>
+              <label class="muted">电影目录 <input id="dir-movie" style="width:110px"></label>
+            </div>
+            <p class="muted" style="margin:.7rem 0 .3rem">电视剧地区映射（原产地 → 文件夹）</p>
+            <textarea id="dir-tv-region" rows="4" spellcheck="false"></textarea>
+            <p class="muted" style="margin:.7rem 0 .3rem">电视剧特殊分类（键 → 文件夹）</p>
+            <textarea id="dir-tv-special" rows="3" spellcheck="false"></textarea>
+            <p class="muted" style="margin:.7rem 0 .3rem">电影分类映射（原产地 / animation → 文件夹）</p>
+            <textarea id="dir-movie-category" rows="4" spellcheck="false"></textarea>
+            <p class="muted" style="margin:.7rem 0 .3rem">命名模板</p>
+            <div style="display:flex;flex-wrap:wrap;gap:.55rem;align-items:center">
+              <label class="muted">剧名夹 <input id="dir-title-template" style="width:170px"></label>
+              <label class="muted">季夹 <input id="dir-season-template" style="width:150px"></label>
+              <label class="muted">单集文件 <input id="dir-episode-template" style="width:300px"></label>
+            </div>
+            <p class="muted">示例路径：<span id="directories-preview">—</span></p>
+            <div style="display:flex;flex-wrap:wrap;gap:.55rem;align-items:center;margin-top:.7rem">
+              <button type="submit" class="btn btn-primary">保存目录设置</button>
+              <button type="button" class="btn" id="directories-reset">恢复默认</button>
+            </div>
+          </form>
+          <p id="directories-msg" class="muted"></p>
+        </div>
         <div class="card">
           <h2>登录账号</h2>
           <p class="muted">当前登录用户名：<span id="account-username">…</span>（来源：<span id="account-source">…</span>）。初始账号密码来自部署时的 Secrets，在这里修改后以新账号为准（密码只存哈希）。修改须验证当前密码；保存后其他设备上的旧登录会失效，本浏览器会自动续上新登录。</p>
@@ -2638,6 +2732,7 @@ async function loadSettings() {
   document.getElementById('topbar-user').textContent = uname || '';
   renderCookieSettings(data.settings.quark_cookie);
   renderChannelSettings(data.settings.tg_channels);
+  renderDirectorySettings(data.settings.directories, data.settings.directories_custom);
   loadDriverKeys();
 }
 function renderCookieSettings(c) {
@@ -2689,6 +2784,95 @@ function renderChannelSettings(t) {
     + '；当前生效 ' + t.count + ' 个'
     + (t.priority_only ? (t.priority_fallback ? '（优先开关已开，但与优先集无交集，已退回全量）' : '（仅夸克优先 ' + t.priority_count + ' 个）') : '');
 }
+/* ---------- settings: library directories ---------- */
+var NL = String.fromCharCode(10);
+function mapToText(obj) {
+  var keys = Object.keys(obj || {});
+  keys.sort(function (a, b) {
+    if (a === '*') return 1;
+    if (b === '*') return -1;
+    return a < b ? -1 : 1;
+  });
+  return keys.map(function (k) { return k + '=' + obj[k]; }).join(NL);
+}
+function textToMap(text) {
+  var out = {};
+  var lines = String(text || '').split(NL);
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line) continue;
+    var idx = line.indexOf('=');
+    if (idx <= 0) continue;
+    var k = line.slice(0, idx).trim();
+    var v = line.slice(idx + 1).trim();
+    if (k && v) out[k] = v;
+  }
+  return out;
+}
+function collectDirectories() {
+  return {
+    base_dir: document.getElementById('dir-base').value.trim(),
+    tv_dir: document.getElementById('dir-tv').value.trim(),
+    movie_dir: document.getElementById('dir-movie').value.trim(),
+    tv_region_map: textToMap(document.getElementById('dir-tv-region').value),
+    tv_special_map: textToMap(document.getElementById('dir-tv-special').value),
+    movie_category_map: textToMap(document.getElementById('dir-movie-category').value),
+    title_template: document.getElementById('dir-title-template').value.trim(),
+    season_template: document.getElementById('dir-season-template').value.trim(),
+    episode_name_template: document.getElementById('dir-episode-template').value.trim()
+  };
+}
+function dirPreviewOf(d) {
+  var title = String(d.title_template || '').split('{title}').join('谷雨').split('{year}').join('2026');
+  var season = String(d.season_template || '').split('{season:02}').join('01').split('{season}').join('1');
+  var ep = String(d.episode_name_template || '').split('{title}').join('谷雨')
+    .split('{season:02}').join('01').split('{season}').join('1')
+    .split('{episode:02}').join('01').split('{episode}').join('1');
+  var region = (d.tv_region_map && (d.tv_region_map.CN || d.tv_region_map['*'])) || '';
+  return [d.base_dir, d.tv_dir, region, title, season, ep + '.mkv'].filter(Boolean).join('/');
+}
+function updateDirPreview() {
+  document.getElementById('directories-preview').textContent = dirPreviewOf(collectDirectories());
+}
+function renderDirectorySettings(d, custom) {
+  var st = document.getElementById('directories-status');
+  if (!d) { st.textContent = '—'; return; }
+  document.getElementById('dir-base').value = d.base_dir || '';
+  document.getElementById('dir-tv').value = d.tv_dir || '';
+  document.getElementById('dir-movie').value = d.movie_dir || '';
+  document.getElementById('dir-tv-region').value = mapToText(d.tv_region_map);
+  document.getElementById('dir-tv-special').value = mapToText(d.tv_special_map);
+  document.getElementById('dir-movie-category').value = mapToText(d.movie_category_map);
+  document.getElementById('dir-title-template').value = d.title_template || '';
+  document.getElementById('dir-season-template').value = d.season_template || '';
+  document.getElementById('dir-episode-template').value = d.episode_name_template || '';
+  st.textContent = custom ? '使用自定义设置' : '使用默认设置（按夸克实际结构预填）';
+  updateDirPreview();
+}
+document.getElementById('directories-form').addEventListener('input', updateDirPreview);
+document.getElementById('directories-form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  var msg = document.getElementById('directories-msg');
+  var r = await fetch('/api/settings', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ directories: collectDirectories() })
+  });
+  var data = await r.json().catch(function () { return null; });
+  if (!r.ok) { msg.textContent = data && data.error ? data.error.message : '保存失败'; return; }
+  msg.textContent = '已保存。Driver 下次取配置时生效。';
+  loadSettings();
+});
+document.getElementById('directories-reset').addEventListener('click', async function () {
+  if (!confirm('恢复为默认入库目录设置吗？自定义的路径与映射会被删除。')) return;
+  var r = await fetch('/api/settings', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ reset_directories: true })
+  });
+  if (!r.ok) { alert('恢复失败'); return; }
+  document.getElementById('directories-msg').textContent = '已恢复默认目录设置。';
+  loadSettings();
+});
+
 /* ---------- settings: Driver API keys ---------- */
 function showOnceKey(token) {
   var box = document.getElementById('dk-once');
@@ -2932,6 +3116,7 @@ export default {
         if (pathname === "/api/driver/logs" && req.method === "POST") return handleDriverLogs(req, store);
         if (pathname === "/api/driver/config" && req.method === "GET") return handleDriverConfig(store, env);
         if (pathname === "/api/driver/quark-status" && req.method === "POST") return handleDriverQuarkStatus(req, store);
+        if (pathname === "/api/driver/agent-guide" && req.method === "GET") return handleDriverAgentGuide();
         return err("not_found", "unknown driver endpoint", 404);
       }
 

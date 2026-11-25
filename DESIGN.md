@@ -1,7 +1,17 @@
-# PanPilot 设计稿 v0.6（已部署上线）
+# PanPilot 设计稿 v0.7（已部署上线）
 
-> 状态：v0.6 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
+> 状态：v0.7 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
 > 线上验证（health 为 store=d1、登录与 Driver 鉴权正常）。本文档描述目标架构与接口契约。
+>
+> v0.7 变更（用户拍板）：(1) **入库目录成为一等设置**（settings 键 `directories`，
+> 默认值与用户夸克真实结构一致：根「电影电视剧」下只有电视剧/电影两夹；电视剧下
+> 地区夹为国产剧/欧美剧/**日韩剧（日韩合并）**，国漫/纪录片/综艺同在电视剧下；
+> 电影下为华语电影/外语电影/动画电影）。设置页可改路径、三个映射与命名模板，
+> `GET /api/driver/config` 返回生效值；**分类一律以 directories 设置为准**——
+> TMDB 回填映射改为经映射表解析（JP/KR→日韩剧），不再硬编码。(2) **AI Driver
+> 操作文档三处落点**：`docs/AI_DRIVER_GUIDE.md`（详细版源头）、仓库根
+> `AGENTS.md`（精简版）、站内接口 `GET /api/driver/agent-guide`（Driver 鉴权，
+> 返回详细版全文；由 `scripts/gen-guide.mjs` 从 docs 生成 `src/guide.ts`）。
 >
 > v0.6 变更（用户拍板）：**Driver 需要的一切凭据都从 PanPilot 下发** ——
 > `GET /api/driver/config` 在夸克 Cookie、频道清单之外新增下发 TMDB API Key；
@@ -80,12 +90,24 @@ Secret 中，不进 D1/代码/日志）。网页端永远看不到 Cookie（明�
 
 ## 3. 用户目录规范（Driver 入库必须遵守）
 
+规范由 settings 键 `directories` 定义（见 §4.6），**分类以该设置为准**；
+默认值来自用户夸克的真实结构（2026-11-25 经 Cookie 用 API 实读确认）：
+
 ```
-电影电视剧 / {电视剧|电影|综艺} / {地区分类，如 国产剧|港台剧|日剧|韩剧|欧美剧}
-  / {剧名} ({年份}) / Season {N}
-  / {剧名} - S{xx}E{yy} - 第 {y} 集.mkv
+电影电视剧（base_dir）
+├─ 电视剧（tv_dir）
+│   ├─ {地区分类：国产剧|欧美剧|日韩剧}   ← tv_region_map，JP/KR 合并为日韩剧
+│   ├─ {特殊分类：国漫|纪录片|综艺}        ← tv_special_map，同在电视剧下
+│   └─ {剧名} ({年份}) / Season {N} / {剧名} - S{xx}E{yy} - 第 {y} 集.mkv
+│      （剧名夹也可直接放在电视剧层——盘点时各层都要找、找到就复用）
+└─ 电影（movie_dir）
+    └─ {分类：华语电影|外语电影|动画电影}   ← movie_category_map
+       / {剧名} ({年份}) /（电影文件，无 Season 层；剧名夹也可直放电影层）
 ```
 
+- 模板（title_template / season_template / episode_name_template）同在
+  `directories` 里，默认值分别为 `{title} ({year})`、`Season {season}`、
+  `{title} - S{season:02}E{episode:02} - 第 {episode} 集`。
 - 电影不建 `Season N` 层；综艺的集号语义（期/集）在订阅字段中单独标注。
 - 转存前先盘点目标目录已有集数，只转 `源集号集 − 已有集号集`，不整包重复转存。
 - 同一分享含多个画质子文件夹时，默认选与已有文件规格一致的一版，不混版本；
@@ -201,6 +223,13 @@ Secret 中，不进 D1/代码/日志）。网页端永远看不到 Cookie（明�
 （`tg_channels_priority_only`）。优先开关的语义：默认清单时直接取 76 子集；自定义清单时
 取其与 76 子集的交集，交集为空则退回自定义全量并在 Driver config 里以
 `tg_channels_priority_fallback: true` 标注。
+`directories`（v0.7）：入库目录设置 JSON（结构与校验见 `src/directories.ts`：
+base_dir / tv_dir / movie_dir、三组映射 tv_region_map / tv_special_map /
+movie_category_map、三个命名模板）。无此键时生效值为与用户真实夸克结构一致的
+默认对象；设置页可保存（保存前服务端校验：路径不含首尾斜杠、映射值非空且为
+单层文件夹名、模板含必要占位符，非法返回 400）与恢复默认（删除该键）。
+`GET /api/driver/config` 与 `GET /api/settings` 都返回生效值；TMDB 选剧回填的
+地区分类也经同一组映射解析（regionForMedia），**分类以 directories 为准**。
 `tmdb_api_key` 由设置页写入（见 §11 已定项 3），读取时只返回末 4 位掩码，完整 Key 不出服务端。
 夸克 Cookie 相关键（v0.5）：`quark_cookie_enc`（AES-GCM 密文 JSON `{iv, ct}`，**绝无明文**）、
 `quark_cookie_updated_at`、`quark_cookie_status` / `quark_cookie_checked_at`（Driver 回报的
@@ -255,8 +284,9 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
 | `POST /api/driver/progress` | 回写集进度与订阅状态 | `{ task_id, episodes: [{season, episode, status, source_share_code?, quark_fid?, file_name?, file_size?}], subscription_status?, next_check_at?, note? }` |
 | `POST /api/driver/heartbeat` | 续约 + 存活上报 | `{ task_id, driver_id }` → `{ lease_expires_at }`；同时可上报 `driver_status`（如 `quark_login_ok: false`） |
 | `POST /api/driver/logs`（可选） | 批量上报日志 | `{ task_id?, logs: [{level, event, detail?}] }` |
-| `GET /api/driver/config` | 取本轮执行配置（v0.5；v0.6 新增 TMDB Key 下发） | → `{ quark_cookie: string\|null, tmdb_api_key: string\|null, tg_channels: string[], tg_channels_priority_only, tg_channels_priority_fallback, check_interval_hours }`；响应 `Cache-Control: no-store`；每次取用写一条审计日志（只记事件与存在性，不记内容） |
+| `GET /api/driver/config` | 取本轮执行配置（v0.5；v0.6 新增 TMDB Key 下发；v0.7 新增 directories） | → `{ quark_cookie: string\|null, tmdb_api_key: string\|null, tg_channels: string[], tg_channels_priority_only, tg_channels_priority_fallback, check_interval_hours, directories: DirectorySettings }`；响应 `Cache-Control: no-store`；每次取用写一条审计日志（只记事件与存在性，不记内容） |
 | `POST /api/driver/quark-status` | 回报夸克 Cookie 有效性（v0.5） | `{ status: "ok"\|"invalid", note?, driver_id? }` → 存 settings 并在设置页展示；`invalid` 时页面红色提示重新粘贴 |
+| `GET /api/driver/agent-guide` | AI Driver 操作手册全文（v0.7） | → `text/markdown`（no-store）；内容与 `docs/AI_DRIVER_GUIDE.md` 一致（经 `src/guide.ts` 打包），仓库根 `AGENTS.md` 为其精简版 |
 
 网页端 API（非 Driver）：
 
@@ -360,7 +390,8 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
 3. ~~TMDB API Key 提供方式~~ **已定**：参考 MoviePilot 机制 —— TMDB API Key 在
    **PanPilot 设置页配置并保存**（存 settings 表，页面只显示末 4 位掩码，可更新/清除）；
    订阅流程为先 TMDB 搜索选剧、点选后回填元数据，**订阅绑定 TMDB ID 而非只存名字，后续按季订阅**；
-   地区分类按 TMDB `origin_country` 映射（CN→国产剧、HK/TW→港台剧、JP→日剧、KR→韩剧、其他→欧美剧，电影同理）。
+   地区分类按 TMDB `origin_country` 映射（v0.7 起改经 `directories` 映射表
+   解析，默认值见已定项 8；本项原记的「HK/TW→港台剧、JP→日剧、KR→韩剧」已被其取代）。
    Key 未配置时选剧功能给出明确提示，手动填写订阅仍可用。
 
 已定（2026-11-25 用户追加拍板，v0.5 已实现并本地验证）：
@@ -377,6 +408,15 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
    PanPilot 的 API Key。API Key 后台可管理：每个 Driver 可命名创建自己的 Key，
    可重置、可吊销，DB 只存 SHA-256 哈希、明文只出现一次；`DRIVER_TOKEN` Secret
    保留为系统引导 Key（见 §4.7、§7）。无有效 Key 时 Driver 接口一律 401。
+
+已定（2026-11-25 用户追加拍板，v0.7 已实现并本地验证）：
+
+8. **入库目录以设置为准 + AI Driver 文档**：目录规范做成 settings 键
+   `directories`（默认值按用户夸克真实结构：日韩合并、国漫/纪录片/综艺在
+   电视剧下、电影三分类），设置页可改、Driver config 下发生效值、TMDB
+   分类映射与之对齐；同时为「未来的 AI Driver」提供操作手册三处落点
+   （`docs/AI_DRIVER_GUIDE.md` / 根 `AGENTS.md` / `GET /api/driver/agent-guide`），
+   内容含标准十步流程、夸克接口族、异常分支与安全红线（见 §3、§4.6、§6）。
 
 仍待定：
 

@@ -1,9 +1,13 @@
 # PanPilot
 
-> Status: v0.6 — **deployed 2026-11-25** via the Cloudflare API to https://panpilot.ttai.net
+> Status: v0.7 — **deployed 2026-11-25** via the Cloudflare API to https://panpilot.ttai.net
 > (verified live: D1 store, password login, Driver auth); source is developed in the
 > public repository below.
-> 状态：v0.6 — **已于 2026-11-25 经 Cloudflare API 部署上线**并完成线上验证；源码在本仓库公开开发。设计见 [DESIGN.md](./DESIGN.md)。
+> 状态：v0.7 — **已于 2026-11-25 经 Cloudflare API 部署上线**并完成线上验证；源码在本仓库公开开发。设计见 [DESIGN.md](./DESIGN.md)。
+> v0.7 新增：入库目录做成设置页可改的 `directories` 设置（默认值与用户夸克真实
+> 结构一致：日韩合并、国漫/纪录片/综艺在电视剧下、电影分华语/外语/动画），Driver
+> config 下发生效值、TMDB 分类与之对齐；新增写给 AI Driver 的操作手册
+> （docs/AI_DRIVER_GUIDE.md、根目录 AGENTS.md、站内 `GET /api/driver/agent-guide`）。
 > v0.6 新增：Driver API Key 可在设置页按 Driver 命名创建/重置/吊销（服务端只存 SHA-256
 > 哈希，明文只显示一次），`GET /api/driver/config` 一并下发 TMDB API Key —— Driver
 > 需要的一切凭据都从 PanPilot 取，无有效 Key 时 Driver 接口一律 401、拿不到任何数据。
@@ -70,10 +74,12 @@ Browser ──(username/password login)──► Workers (PanPilot) ──► D1
                                                   └─► Quark: list / transfer selected episodes / rename
 ```
 
-Library layout enforced by the Driver / Driver 入库目录规范：
+Library layout enforced by the Driver / Driver 入库目录规范（`directories`
+设置，设置页可改，默认值与用户夸克真实结构一致）：
 
 ```
-电影电视剧 / 电视剧|电影|综艺 / 地区分类（如国产剧） / 剧名 (年份) / Season N
+电影电视剧 / 电视剧 / 地区分类（国产剧|欧美剧|日韩剧）或特殊分类（国漫|纪录片|综艺） / 剧名 (年份) / Season N
+电影电视剧 / 电影 / 分类（华语电影|外语电影|动画电影） / 剧名 (年份)
 文件名：剧名 - SxxEyy - 第 y 集.mkv
 ```
 
@@ -141,10 +147,40 @@ see [DESIGN.md](./DESIGN.md). 完整设计（表结构、Driver API、状态机�
   有效频道，可自定义/恢复默认；「只用夸克优先」开关对应其中 76 个确认有夸克链接的频道。
 - **Subscribe flow （选剧）**: on the home page, search TMDB (zh-CN) by title, pick a
   result, and the form is auto-filled with TMDB id, year, type, region category
-  (mapped from `origin_country`: CN→国产剧， HK/TW→港台剧， JP→日剧， KR→韩剧， else→欧美剧）
   plus per-season episode counts — MoviePilot-style, subscriptions bind to a TMDB id.
+  The region category is resolved through the `directories` settings maps
+  (defaults: CN/HK/TW→国产剧， JP/KR→日韩剧， else→欧美剧； Chinese animation→国漫，
+  documentary→纪录片， reality/talk→综艺； movies: 华语电影/动画电影/外语电影）.
   If no TMDB key is configured, the search explains that and manual entry still works.
-  订阅页可按剧名搜 TMDB 选剧并自动回填；未配置 Key 时有明确提示，手动填写仍可用。
+  订阅页可按剧名搜 TMDB 选剧并自动回填，地区分类经 directories 映射解析
+  （分类以该设置为准）；未配置 Key 时有明确提示，手动填写仍可用。
+- **Library directories （入库目录）**: the settings page edits the folder layout
+  the Driver files into — base/TV/movie folder names, the three category maps
+  (TV regions, TV specials, movie categories) and the naming templates.
+  Defaults mirror the owner's real Quark structure (see above); the effective
+  object is returned by `GET /api/settings` and shipped to Drivers in
+  `GET /api/driver/config`. Invalid values are rejected with 400.
+  设置页可编辑入库目录的路径、三组分类映射与命名模板；生效值经设置接口与
+  Driver config 下发，非法值会被 400 拒绝，可一键恢复默认。
+
+## 给 AI Driver 的文档 | For AI Drivers
+
+If you are an AI agent (or a program) acting as a PanPilot **Driver**, start here:
+
+- **[AGENTS.md](./AGENTS.md)** — the concise brief: your role, auth, the
+  ten-step round, exception handling and the API list.
+- **[docs/AI_DRIVER_GUIDE.md](./docs/AI_DRIVER_GUIDE.md)** — the full
+  operating manual (source of truth): claim leases, inventory-before-search,
+  candidate scoring, the Quark API family, rename/verify/write-back,
+  cookie-invalid and other exception branches, and the security red lines.
+- **Online**: `GET /api/driver/agent-guide` on a deployed instance returns
+  the same full guide as Markdown (Driver API key required) — fetch it at
+  the start of a round if you have not read it.
+
+如果你是担任 Driver 的 AI 代理：先读 AGENTS.md 速览，再按
+docs/AI_DRIVER_GUIDE.md 详细手册执行；线上实例也可经
+`GET /api/driver/agent-guide`（需 Driver Key）取回手册全文。三处内容保持
+同步，手册为源头。
 
 ## 本地运行 | Run locally
 
