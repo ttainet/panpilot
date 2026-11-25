@@ -961,7 +961,79 @@ document.getElementById('modal-backdrop').addEventListener('click', function (e)
   if (e.target === this) closeModal();
 });
 
-async function openDetail(item, overrideMediaType) {
+var TMDB_STATUS_ZH = {
+  'Returning Series': '连载中',
+  'In Production': '制作中',
+  'Planned': '筹备中',
+  'Ended': '已完结',
+  'Canceled': '已取消',
+  'Pilot': '试播集',
+  'Released': '已上映',
+  'Post Production': '后期制作',
+  'Rumored': '传闻中'
+};
+var COUNTRY_ZH = {
+  CN: '中国大陆', HK: '中国香港', TW: '中国台湾', US: '美国', GB: '英国', UK: '英国',
+  JP: '日本', KR: '韩国', FR: '法国', DE: '德国', CA: '加拿大', AU: '澳大利亚',
+  ES: '西班牙', IT: '意大利', IN: '印度', TH: '泰国', RU: '俄罗斯', SG: '新加坡',
+  SE: '瑞典', DK: '丹麦', NO: '挪威', BE: '比利时', NL: '荷兰', BR: '巴西', MX: '墨西哥'
+};
+var LANG_ZH = {
+  zh: '中文', en: '英语', ja: '日语', ko: '韩语', fr: '法语', de: '德语',
+  es: '西班牙语', it: '意大利语', ru: '俄语', th: '泰语', hi: '印地语',
+  pt: '葡萄牙语', sv: '瑞典语', da: '丹麦语', no: '挪威语', cn: '粤语'
+};
+function profileUrl(p) { return p ? 'https://image.tmdb.org/t/p/w185' + p : null; }
+function backdropUrl(p) { return p ? 'https://image.tmdb.org/t/p/w780' + p : null; }
+function fmtVoteCount(n) {
+  if (!n || n <= 0) return '';
+  if (n >= 10000) return (n / 10000).toFixed(1) + '万';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+  return String(n);
+}
+function mapCountries(arr) {
+  if (!arr || !arr.length) return [];
+  var out = [];
+  for (var i = 0; i < arr.length; i++) {
+    var k = String(arr[i] || '').trim();
+    if (!k) continue;
+    var zh = COUNTRY_ZH[k] || k;
+    if (out.indexOf(zh) < 0) out.push(zh);
+  }
+  return out;
+}
+function pad2(n) { return n < 10 ? '0' + n : String(n); }
+function renderModalFacts(facts) {
+  if (!facts || !facts.length) return '';
+  return '<div class="modal-facts">' + facts.map(function (f) {
+    return '<div class="modal-fact"><div class="modal-fact-label">' + esc(f.label) + '</div>'
+      + '<div class="modal-fact-val">' + (f.html ? f.value : esc(f.value)) + '</div></div>';
+  }).join('') + '</div>';
+}
+function renderCastSection(cast, fallbackActors) {
+  if (cast && cast.length) {
+    return '<div class="modal-section"><div class="modal-section-title">主要演员（' + cast.length + '）</div>'
+      + '<div class="cast-strip">' + cast.map(function (c) {
+        var av = c.profile_path
+          ? '<img class="cast-avatar" src="' + esc(profileUrl(c.profile_path)) + '" alt="' + esc(c.name) + '" loading="lazy">'
+          : '<div class="cast-avatar-ph">' + esc((c.name || '?').slice(0, 1)) + '</div>';
+        return '<div class="cast-card" title="' + esc(c.name + (c.character ? ' · 饰 ' + c.character : '')) + '">'
+          + av
+          + '<div class="cast-name">' + esc(c.name) + '</div>'
+          + (c.character ? '<div class="cast-role">' + esc(c.character) + '</div>' : '')
+          + '</div>';
+      }).join('') + '</div></div>';
+  }
+  if (fallbackActors && fallbackActors.length) {
+    return '<div class="modal-section"><div class="modal-section-title">主演阵容</div>'
+      + '<div class="cast-chips">' + fallbackActors.map(function (a) {
+        return '<span class="cast-chip">' + esc(a) + '</span>';
+      }).join('') + '</div></div>';
+  }
+  return '';
+}
+
+async function openDetail(item, overrideMediaType, extra) {
   modalDetails = null;
   var box = document.getElementById('modal-content');
   box.innerHTML = '<div class="skeleton" style="height:170px;margin-bottom:1rem"></div><div class="skeleton" style="height:80px"></div>';
@@ -979,12 +1051,15 @@ async function openDetail(item, overrideMediaType) {
   modalDetails = d;
   var poster = d.poster_path
     ? '<img src="' + posterUrl(d.poster_path, 'w342') + '" alt="">'
-    : '<div class="poster-ph">' + esc((d.title || '?').slice(0, 1)) + '</div>';
+    : (extra && extra.poster_url
+      ? '<img src="' + esc(extra.poster_url) + '" alt="">'
+      : '<div class="poster-ph">' + esc((d.title || '?').slice(0, 1)) + '</div>');
   var seasonOptions = '';
   var seasons = (d.seasons || []).filter(function (s) { return s.season >= 1; });
   for (var i = 0; i < seasons.length; i++) {
+    var sYear = seasons[i].air_date ? seasons[i].air_date.slice(0, 4) : '';
     seasonOptions += '<option value="' + seasons[i].season + '" data-eps="' + seasons[i].episode_count + '">第 '
-      + seasons[i].season + ' 季（' + seasons[i].episode_count + ' 集）</option>';
+      + seasons[i].season + ' 季 · ' + seasons[i].episode_count + '集' + (sYear ? ' (' + sYear + ')' : '') + '</option>';
   }
   var modeField = '<div class="field"><label class="field-label" for="m-mode">执行模式</label>'
     + '<select id="m-mode"><option value="auto" selected>自动转存</option><option value="manual">手动确认</option></select></div>';
@@ -996,17 +1071,80 @@ async function openDetail(item, overrideMediaType) {
       + '<select id="m-season">' + seasonOptions + '</select></div>' + modeField + qualityField + '</div>'
     : '<div class="form-grid-2" style="margin-top:.85rem">' + modeField + qualityField + '</div>';
 
-  box.innerHTML = '<div class="modal-hero">' + poster
-    + '<div style="flex:1;min-width:0"><div class="modal-title">' + esc(d.title)
-    + (d.year ? ' <span class="sub-year num">' + d.year + '</span>' : '') + '</div>'
-    + '<div class="tag-row"><span class="tag">' + mediaLabel(d.media_type) + '</span>'
+  var banner = d.backdrop_path
+    ? '<div class="modal-banner" style="background-image:url(\'' + esc(backdropUrl(d.backdrop_path)) + '\')"></div>'
+    : '';
+  var subParts = [];
+  if (d.original_title && d.original_title !== d.title) subParts.push(d.original_title);
+  if (d.tagline) subParts.push('“' + d.tagline + '”');
+  var subLine = subParts.length ? '<div class="modal-sub-title">' + esc(subParts.join(' · ')) + '</div>' : '';
+
+  var subbed = isItemSubscribed({ tmdb_id: d.tmdb_id, media_type: d.media_type, title: d.title });
+  var genres = (d.genres && d.genres.length ? d.genres : (extra && extra.genres)) || [];
+  var statusZh = d.status ? (TMDB_STATUS_ZH[d.status] || d.status) : '';
+  var vc = fmtVoteCount(d.vote_count);
+  var tagHtml = '<span class="tag">' + mediaLabel(d.media_type) + '</span>'
     + (d.region ? '<span class="tag">' + esc(d.region) + '</span>' : '')
-    + (d.rating ? '<span class="tag tag-rate">★ ' + Number(d.rating).toFixed(1) + '</span>' : '')
-    + (d.genres && d.genres.length ? '<span class="tag">' + esc(d.genres.join(' / ')) + '</span>' : '') + '</div>'
+    + (d.rating ? '<span class="tag tag-rate">TMDB ★ ' + Number(d.rating).toFixed(1) + (vc ? ' (' + vc + ')' : '') + '</span>' : '')
+    + (extra && extra.rating ? '<span class="tag tag-douban">豆瓣 ★ ' + Number(extra.rating).toFixed(1) + '</span>' : '')
+    + (statusZh ? '<span class="tag tag-status">' + esc(statusZh) + '</span>' : '')
+    + (extra && extra.honor ? '<span class="tag tag-honor">' + esc(extra.honor) + '</span>' : '')
+    + (genres.length ? '<span class="tag">' + esc(genres.join(' / ')) + '</span>' : '');
+
+  var facts = [];
+  var directors = (d.directors && d.directors.length ? d.directors : (extra && extra.directors)) || [];
+  if (directors.length) facts.push({ label: d.media_type === 'movie' ? '导演' : '导演 / 主创', value: directors.join(' / ') });
+  if (d.writers && d.writers.length) facts.push({ label: '编剧', value: d.writers.join(' / ') });
+  if (d.release_date) facts.push({ label: d.media_type === 'movie' ? '上映日期' : '首播日期', value: d.release_date });
+  if (d.media_type === 'movie' && d.runtime) {
+    facts.push({ label: '片长', value: d.runtime + ' 分钟' });
+  } else if (d.media_type !== 'movie' && d.episode_run_time) {
+    facts.push({ label: '单集时长', value: '约 ' + d.episode_run_time + ' 分钟' });
+  }
+  if (d.media_type !== 'movie') {
+    var progParts = [];
+    if (d.number_of_seasons) progParts.push('共 ' + d.number_of_seasons + ' 季');
+    if (d.number_of_episodes) progParts.push(d.number_of_episodes + ' 集');
+    if (d.last_episode) {
+      progParts.push('已播至 S' + pad2(d.last_episode.season) + 'E' + pad2(d.last_episode.episode));
+    } else if (extra && extra.episodes_info) {
+      progParts.push(extra.episodes_info);
+    }
+    if (d.next_episode) {
+      progParts.push('下集 S' + pad2(d.next_episode.season) + 'E' + pad2(d.next_episode.episode)
+        + (d.next_episode.air_date ? ' (' + d.next_episode.air_date + ')' : ''));
+    }
+    if (progParts.length) facts.push({ label: '剧集进度', value: progParts.join(' · ') });
+  }
+  if (d.networks && d.networks.length) facts.push({ label: '播出平台', value: d.networks.join(' / ') });
+  var countriesText = mapCountries((d.production_countries && d.production_countries.length ? d.production_countries : d.origin_country) || (extra && extra.countries));
+  var langZh = d.original_language ? (LANG_ZH[d.original_language] || d.original_language.toUpperCase()) : '';
+  var areaLang = [countriesText.join(' / '), langZh].filter(Boolean).join(' · ');
+  if (areaLang) facts.push({ label: '制片地区 / 语言', value: areaLang });
+  var tmdbHref = 'https://www.themoviedb.org/' + (d.media_type === 'movie' ? 'movie' : 'tv') + '/' + d.tmdb_id;
+  var extHtml = '<div class="ext-links"><a class="ext-link" href="' + esc(tmdbHref) + '" target="_blank" rel="noopener noreferrer">TMDB ↗</a>';
+  if (extra && extra.douban_id) {
+    extHtml += '<a class="ext-link" href="https://movie.douban.com/subject/' + encodeURIComponent(extra.douban_id) + '/" target="_blank" rel="noopener noreferrer">豆瓣 ↗</a>';
+  }
+  extHtml += '</div>';
+  facts.push({ label: '外部资料', value: extHtml, html: true });
+
+  var overviewText = d.overview || (extra && extra.overview) || '';
+  var castHtml = renderCastSection(d.cast, extra && extra.actors);
+
+  box.innerHTML = banner
+    + '<div class="modal-hero">' + poster
+    + '<div style="flex:1;min-width:0"><div class="modal-title"><span>' + esc(d.title) + '</span>'
+    + (d.year ? '<span class="sub-year num">' + d.year + '</span>' : '')
+    + (subbed ? '<span class="tag tag-subbed">已订阅</span>' : '') + '</div>'
+    + subLine
+    + '<div class="tag-row">' + tagHtml + '</div>'
     + controls + '</div></div>'
-    + (d.overview ? '<div class="modal-section"><div class="modal-section-title">剧情简介</div><p class="overview">' + esc(d.overview) + '</p></div>' : '')
+    + renderModalFacts(facts)
+    + castHtml
+    + (overviewText ? '<div class="modal-section"><div class="modal-section-title">剧情简介</div><p class="overview">' + esc(overviewText) + '</p></div>' : '')
     + '<div class="modal-actions"><button type="button" class="btn" id="m-cancel">取消</button>'
-    + '<button type="button" class="btn btn-primary" id="m-subscribe">确认订阅</button></div>';
+    + '<button type="button" class="btn btn-primary" id="m-subscribe">' + (subbed ? '再次确认订阅' : '确认订阅') + '</button></div>';
   enhanceSelects(box);
   document.getElementById('m-cancel').addEventListener('click', closeModal);
   document.getElementById('m-subscribe').addEventListener('click', subscribeFromModal);
@@ -2301,7 +2439,7 @@ async function openExploreCard(cardEl) {
     var r = await api('/api/explore/match' + qs);
     var data = await r.json().catch(function () { return null; });
     if (data && data.tmdb_configured && data.matched && data.matched.tmdb_id) {
-      openDetail({ tmdb_id: data.matched.tmdb_id, media_type: data.matched.media_type }, item.media_type === 'variety' ? 'variety' : null);
+      openDetail({ tmdb_id: data.matched.tmdb_id, media_type: data.matched.media_type }, item.media_type === 'variety' ? 'variety' : null, item);
       return;
     }
     openQuickSubscribeModal(item);
@@ -2317,13 +2455,30 @@ function openQuickSubscribeModal(item) {
     : '<div class="poster-ph">' + esc((item.title || '?').slice(0, 1)) + '</div>';
   var mType = item.media_type || 'tv';
   var isMovie = mType === 'movie';
+  var subbed = isItemSubscribed(item);
+  var genres = item.genres && item.genres.length ? item.genres : [];
+  var facts = [];
+  if (item.directors && item.directors.length) facts.push({ label: '导演 / 主创', value: item.directors.join(' / ') });
+  if (item.countries && item.countries.length) facts.push({ label: '制片地区', value: item.countries.join(' / ') });
+  if (genres.length) facts.push({ label: '类型', value: genres.join(' / ') });
+  if (item.episodes_info) facts.push({ label: '更新进度', value: item.episodes_info });
+  if (item.douban_id) {
+    facts.push({
+      label: '外部资料',
+      value: '<div class="ext-links"><a class="ext-link" href="https://movie.douban.com/subject/' + encodeURIComponent(item.douban_id) + '/" target="_blank" rel="noopener noreferrer">豆瓣主页 ↗</a></div>',
+      html: true
+    });
+  }
   box.innerHTML = '<div class="modal-hero">' + poster
-    + '<div style="flex:1;min-width:0"><div class="modal-title">' + esc(item.title)
-    + (item.year ? ' <span class="sub-year num">' + item.year + '</span>' : '') + '</div>'
-    + '<div class="tag-row"><span class="tag">豆瓣榜单</span>'
+    + '<div style="flex:1;min-width:0"><div class="modal-title"><span>' + esc(item.title) + '</span>'
+    + (item.year ? '<span class="sub-year num">' + item.year + '</span>' : '')
+    + (subbed ? '<span class="tag tag-subbed">已订阅</span>' : '') + '</div>'
+    + '<div class="tag-row"><span class="tag tag-douban">豆瓣榜单</span>'
     + '<span class="tag">' + mediaLabel(mType) + '</span>'
     + (item.region ? '<span class="tag">' + esc(item.region) + '</span>' : '')
-    + (item.rating ? '<span class="tag tag-rate">★ ' + Number(item.rating).toFixed(1) + '</span>' : '') + '</div>'
+    + (item.rating ? '<span class="tag tag-rate">★ ' + Number(item.rating).toFixed(1) + '</span>' : '')
+    + (item.honor ? '<span class="tag tag-honor">' + esc(item.honor) + '</span>' : '')
+    + (genres.length ? '<span class="tag">' + esc(genres.join(' / ')) + '</span>' : '') + '</div>'
     + '<div class="form-grid-3" style="margin-top:.8rem">'
     + '<div class="field"><label class="field-label" for="qm-type">类型</label>'
     + '<select id="qm-type"><option value="tv"' + (mType === 'tv' ? ' selected' : '') + '>电视剧</option>'
@@ -2333,10 +2488,12 @@ function openQuickSubscribeModal(item) {
     + '<div class="field"><label class="field-label" for="qm-mode">执行模式</label>'
     + '<select id="qm-mode"><option value="auto" selected>自动转存</option><option value="manual">手动确认</option></select></div>'
     + '</div></div></div>'
-    + (item.subtitle ? '<p class="muted" style="margin-top:.85rem">' + esc(item.subtitle) + '</p>' : '')
+    + renderModalFacts(facts)
+    + renderCastSection(null, item.actors)
+    + (item.subtitle && !facts.length ? '<p class="muted" style="margin-top:.85rem">' + esc(item.subtitle) + '</p>' : '')
     + (item.overview ? '<div class="modal-section"><div class="modal-section-title">简介</div><p class="overview">' + esc(item.overview) + '</p></div>' : '')
     + '<div class="modal-actions"><button type="button" class="btn" id="qm-cancel">取消</button>'
-    + '<button type="button" class="btn btn-primary" id="qm-submit">确认订阅</button></div>';
+    + '<button type="button" class="btn btn-primary" id="qm-submit">' + (subbed ? '再次确认订阅' : '确认订阅') + '</button></div>';
   enhanceSelects(box);
   document.getElementById('modal-backdrop').hidden = false;
   document.getElementById('qm-cancel').addEventListener('click', closeModal);

@@ -23,6 +23,11 @@ export interface ExploreItem {
   poster_url?: string;
   poster_path?: string;
   overview?: string;
+  directors?: string[];
+  actors?: string[];
+  genres?: string[];
+  countries?: string[];
+  honor?: string;
 }
 
 export const DOUBAN_COLLECTIONS = [
@@ -210,6 +215,55 @@ interface RexxarItem {
   pic?: { normal?: string; large?: string };
   cover?: { url?: string };
   info?: string;
+  honor_infos?: { title?: string; rank?: number }[];
+}
+
+function splitUniqueTokens(raw: string | undefined, limit: number): string[] {
+  if (!raw) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const part of raw.split(/\s+/)) {
+    const s = part.trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+function parseDoubanCardSubtitle(cardSubtitle?: string): {
+  countries?: string[];
+  genres?: string[];
+  directors?: string[];
+  actors?: string[];
+} {
+  if (!cardSubtitle) return {};
+  const parts = cardSubtitle.split("/").map((s) => s.trim()).filter(Boolean);
+  if (parts.length && /^\d{4}$/.test(parts[0])) parts.shift();
+  let countriesRaw: string | undefined;
+  let genresRaw: string | undefined;
+  let directorsRaw: string | undefined;
+  let actorsRaw: string | undefined;
+  if (parts.length >= 4) {
+    [countriesRaw, genresRaw, directorsRaw, actorsRaw] = parts;
+  } else if (parts.length === 3) {
+    [countriesRaw, genresRaw, actorsRaw] = parts;
+  } else if (parts.length === 2) {
+    [countriesRaw, genresRaw] = parts;
+  } else if (parts.length === 1) {
+    countriesRaw = parts[0];
+  }
+  const countries = splitUniqueTokens(countriesRaw, 4);
+  const genres = splitUniqueTokens(genresRaw, 5);
+  const directors = splitUniqueTokens(directorsRaw, 4);
+  const actors = splitUniqueTokens(actorsRaw, 10);
+  return {
+    countries: countries.length ? countries : undefined,
+    genres: genres.length ? genres : undefined,
+    directors: directors.length ? directors : undefined,
+    actors: actors.length ? actors : undefined,
+  };
 }
 
 async function fetchDoubanFallbackSubjects(
@@ -291,6 +345,11 @@ export async function fetchDoubanExplore(
       ? Number(it.rating.value.toFixed(1))
       : undefined;
     const rawPic = it.pic?.normal || it.pic?.large || it.cover?.url;
+    const parsedMeta = parseDoubanCardSubtitle(it.card_subtitle);
+    const firstHonor = Array.isArray(it.honor_infos) ? it.honor_infos[0] : undefined;
+    const honor = firstHonor?.title
+      ? `${firstHonor.title}${typeof firstHonor.rank === "number" && firstHonor.rank > 0 ? ` #${firstHonor.rank}` : ""}`
+      : undefined;
     return {
       source: "douban",
       id: `douban:${it.id ?? it.title ?? ""}`,
@@ -304,6 +363,11 @@ export async function fetchDoubanExplore(
       rating: rate,
       poster_url: wrapDoubanPoster(rawPic),
       overview: typeof it.info === "string" && it.info ? it.info : undefined,
+      directors: parsedMeta.directors,
+      actors: parsedMeta.actors,
+      genres: parsedMeta.genres,
+      countries: parsedMeta.countries,
+      honor,
     };
   });
 

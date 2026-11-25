@@ -2279,11 +2279,40 @@ interface TmdbSeasonInfo {
   season: number;
   episode_count: number;
   name?: string;
+  air_date?: string;
+}
+
+interface TmdbCastMember {
+  id?: number;
+  name: string;
+  character?: string;
+  profile_path?: string;
+}
+
+interface TmdbEpisodeBrief {
+  season: number;
+  episode: number;
+  name?: string;
+  air_date?: string;
 }
 
 interface TmdbDetailItem extends TmdbSearchItem {
   genres: string[];
   status?: string;
+  backdrop_path?: string;
+  tagline?: string;
+  vote_count?: number;
+  release_date?: string;
+  last_air_date?: string;
+  original_language?: string;
+  production_countries?: string[];
+  networks?: string[];
+  episode_run_time?: number;
+  last_episode?: TmdbEpisodeBrief;
+  next_episode?: TmdbEpisodeBrief;
+  directors?: string[];
+  writers?: string[];
+  cast?: TmdbCastMember[];
   number_of_seasons?: number;
   number_of_episodes?: number;
   seasons?: TmdbSeasonInfo[];
@@ -2330,12 +2359,40 @@ async function searchTmdbItems(
   return { results };
 }
 
+function extractEpisodeBrief(raw: unknown): TmdbEpisodeBrief | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const e = raw as Row;
+  const season = Number(e.season_number);
+  const episode = Number(e.episode_number);
+  if (!Number.isFinite(season) || !Number.isFinite(episode)) return undefined;
+  return {
+    season,
+    episode,
+    name: typeof e.name === "string" && e.name ? e.name : undefined,
+    air_date: typeof e.air_date === "string" && e.air_date ? e.air_date : undefined,
+  };
+}
+
+function dedupeNames(names: string[], limit: number): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const n of names) {
+    const s = n.trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 async function getTmdbItemDetails(
   store: Store,
   type: "tv" | "movie",
   id: string,
 ): Promise<{ details?: TmdbDetailItem; errorMessage?: string; errorResponse?: Response }> {
-  const { data, errorResponse } = await tmdbFetch(store, `/${type}/${id}`);
+  const append = type === "tv" ? "credits,aggregate_credits" : "credits";
+  const { data, errorResponse } = await tmdbFetch(store, `/${type}/${id}?append_to_response=${append}`);
   if (errorResponse) {
     const cloned = errorResponse.clone();
     const errJson = (await cloned.json().catch(() => null)) as { error?: { message?: string } } | null;
@@ -2343,11 +2400,62 @@ async function getTmdbItemDetails(
   }
   const r = data as Row;
   const countries = Array.isArray(r.origin_country) ? (r.origin_country as unknown[]).map(String) : [];
+  const prodCountriesRaw = Array.isArray(r.production_countries)
+    ? (r.production_countries as Row[]).map((c) => String(c.iso_3166_1 || c.name || "")).filter(Boolean)
+    : [];
+  const productionCountries = dedupeNames(prodCountriesRaw.length ? prodCountriesRaw : countries, 5);
   const dateStr = String((type === "tv" ? r.first_air_date : r.release_date) ?? "");
   const genreRows = Array.isArray(r.genres) ? (r.genres as Row[]) : [];
   const genres = genreRows.map((g) => String(g.name)).filter(Boolean);
   const genreIds = genreRows.map((g) => Number(g.id)).filter(Number.isFinite);
   const dirs = await getEffectiveDirectories(store);
+
+  const credits = r.credits && typeof r.credits === "object" ? (r.credits as Row) : {};
+  const crew = Array.isArray(credits.crew) ? (credits.crew as Row[]) : [];
+  const createdByNames = type === "tv" && Array.isArray(r.created_by)
+    ? (r.created_by as Row[]).map((p) => String(p.name ?? "")).filter(Boolean)
+    : [];
+  const dirCrewNames = crew
+    .filter((c) => c.job === "Director" || (type === "tv" && c.job === "Series Director"))
+    .map((c) => String(c.name ?? ""));
+  const directors = dedupeNames(createdByNames.length ? createdByNames : dirCrewNames, 4);
+
+  const writerNames = crew
+    .filter((c) => c.department === "Writing" || c.job === "Writer" || c.job === "Screenplay" || c.job === "Story")
+    .map((c) => String(c.name ?? ""));
+  const writers = dedupeNames(writerNames, 4);
+
+  const rawCast = Array.isArray(credits.cast) ? ([...(credits.cast as Row[])]) : [];
+  rawCast.sort((a, b) => Number(a.order ?? 999) - Number(b.order ?? 999));
+  let cast: TmdbCastMember[] = rawCast
+    .filter((c) => typeof c.name === "string" && c.name.trim())
+    .slice(0, 12)
+    .map((c) => ({
+      id: typeof c.id === "number" ? c.id : undefined,
+      name: String(c.name).trim(),
+      character: typeof c.character === "string" && c.character.trim() ? c.character.trim() : undefined,
+      profile_path: typeof c.profile_path === "string" && c.profile_path ? c.profile_path : undefined,
+    }));
+
+  if (type === "tv" && cast.length === 0 && r.aggregate_credits && typeof r.aggregate_credits === "object") {
+    const aggCast = Array.isArray((r.aggregate_credits as Row).cast)
+      ? ((r.aggregate_credits as Row).cast as Row[])
+      : [];
+    cast = aggCast
+      .filter((c) => typeof c.name === "string" && c.name.trim())
+      .slice(0, 12)
+      .map((c) => {
+        const roles = Array.isArray(c.roles) ? (c.roles as Row[]) : [];
+        const charName = roles.length && typeof roles[0].character === "string" ? roles[0].character.trim() : undefined;
+        return {
+          id: typeof c.id === "number" ? c.id : undefined,
+          name: String(c.name).trim(),
+          character: charName || undefined,
+          profile_path: typeof c.profile_path === "string" && c.profile_path ? c.profile_path : undefined,
+        };
+      });
+  }
+
   const base = {
     tmdb_id: Number(r.id),
     media_type: type as MediaType,
@@ -2355,23 +2463,44 @@ async function getTmdbItemDetails(
     original_title: String((type === "tv" ? r.original_name : r.original_title) ?? ""),
     year: dateStr ? Number(dateStr.slice(0, 4)) : undefined,
     origin_country: countries,
+    production_countries: productionCountries.length ? productionCountries : undefined,
+    original_language: typeof r.original_language === "string" && r.original_language ? r.original_language : undefined,
     region: regionForMedia(dirs, countries[0], type as MediaType, genreIds),
     genres,
     poster_url: tmdbPoster(r.poster_path),
     poster_path: typeof r.poster_path === "string" && r.poster_path ? r.poster_path : undefined,
+    backdrop_path: typeof r.backdrop_path === "string" && r.backdrop_path ? r.backdrop_path : undefined,
+    tagline: typeof r.tagline === "string" && r.tagline.trim() ? r.tagline.trim() : undefined,
     rating: typeof r.vote_average === "number" ? r.vote_average : undefined,
+    vote_count: typeof r.vote_count === "number" && r.vote_count > 0 ? r.vote_count : undefined,
+    release_date: dateStr || undefined,
     overview: typeof r.overview === "string" ? r.overview : undefined,
     status: typeof r.status === "string" ? r.status : undefined,
+    directors: directors.length ? directors : undefined,
+    writers: writers.length ? writers : undefined,
+    cast: cast.length ? cast : undefined,
   };
   if (type === "tv") {
     const seasons: TmdbSeasonInfo[] = (Array.isArray(r.seasons) ? (r.seasons as Row[]) : []).map((s) => ({
       season: Number(s.season_number),
       episode_count: Number(s.episode_count),
       name: typeof s.name === "string" ? s.name : undefined,
+      air_date: typeof s.air_date === "string" && s.air_date ? s.air_date : undefined,
     }));
+    const networks = Array.isArray(r.networks)
+      ? dedupeNames((r.networks as Row[]).map((n) => String(n.name ?? "")), 4)
+      : [];
+    const runTimes = Array.isArray(r.episode_run_time)
+      ? (r.episode_run_time as unknown[]).map(Number).filter((n) => Number.isFinite(n) && n > 0)
+      : [];
     return {
       details: {
         ...base,
+        last_air_date: typeof r.last_air_date === "string" && r.last_air_date ? r.last_air_date : undefined,
+        networks: networks.length ? networks : undefined,
+        episode_run_time: runTimes[0],
+        last_episode: extractEpisodeBrief(r.last_episode_to_air),
+        next_episode: extractEpisodeBrief(r.next_episode_to_air),
         number_of_seasons: typeof r.number_of_seasons === "number" ? r.number_of_seasons : undefined,
         number_of_episodes: typeof r.number_of_episodes === "number" ? r.number_of_episodes : undefined,
         seasons,
@@ -2381,7 +2510,7 @@ async function getTmdbItemDetails(
   return {
     details: {
       ...base,
-      runtime: typeof r.runtime === "number" ? r.runtime : undefined,
+      runtime: typeof r.runtime === "number" && r.runtime > 0 ? r.runtime : undefined,
     },
   };
 }
