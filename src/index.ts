@@ -1,6 +1,10 @@
 /**
  * PanPilot — subscription control plane (Cloudflare Workers)
  *
+ * v0.4: MoviePilot-style dark SPA UI (own implementation, layout inspired by
+ * MoviePilot — no GPL code/assets reused), poster-wall subscriptions,
+ * dashboard stats, TMDB poster/overview/rating stored on subscriptions.
+ *
  * v0.3: real implementation.
  * - Web UI protected by a simple username/password login
  *   (APP_USERNAME / APP_PASSWORD secrets, HMAC-signed session cookie).
@@ -30,7 +34,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -56,6 +60,11 @@ export interface Subscription {
   season?: number;
   total_episodes?: number;
   quality_pref?: string;
+  /** Raw TMDB poster path (e.g. /abc.jpg); UI prefixes the image CDN host. */
+  poster_path?: string;
+  overview?: string;
+  /** TMDB vote average at subscribe time. */
+  rating?: number;
   mode: SubMode;
   status: SubStatus;
   target_dir?: string;
@@ -449,6 +458,8 @@ export interface Store {
   addCandidates(subscriptionId: string, candidates: CandidateInput[]): Promise<number>;
   upsertEpisodes(subscriptionId: string, episodes: EpisodeProgressInput[]): Promise<void>;
   getEpisodes(subscriptionId: string): Promise<EpisodeRecord[]>;
+  /** Stored-episode counts grouped by subscription and season (for stats / progress bars). */
+  getStoredCounts(): Promise<{ subscription_id: string; season: number; count: number }[]>;
   addLog(entry: { subscription_id?: string; driver_id?: string; level: string; event: string; detail?: string }): Promise<void>;
   getSetting(key: string): Promise<string | null>;
   setSetting(key: string, value: string): Promise<void>;
@@ -532,6 +543,17 @@ class MemoryStore implements Store {
   async getEpisodes(subscriptionId: string) {
     return [...this.episodes.values()].filter((e) => e.subscription_id === subscriptionId);
   }
+  async getStoredCounts() {
+    const out = new Map<string, { subscription_id: string; season: number; count: number }>();
+    for (const e of this.episodes.values()) {
+      if (e.status !== "stored") continue;
+      const key = `${e.subscription_id}:${e.season}`;
+      const rec = out.get(key) ?? { subscription_id: e.subscription_id, season: e.season, count: 0 };
+      rec.count += 1;
+      out.set(key, rec);
+    }
+    return [...out.values()];
+  }
   async addLog(entry: { subscription_id?: string; driver_id?: string; level: string; event: string; detail?: string }) {
     this.logs.push({ ...entry, created_at: now() });
   }
@@ -563,6 +585,9 @@ function rowToSub(r: Row): Subscription {
   if (r.season != null) sub.season = Number(r.season);
   if (r.total_episodes != null) sub.total_episodes = Number(r.total_episodes);
   if (r.quality_pref != null) sub.quality_pref = String(r.quality_pref);
+  if (r.poster_path != null) sub.poster_path = String(r.poster_path);
+  if (r.overview != null) sub.overview = String(r.overview);
+  if (r.rating != null) sub.rating = Number(r.rating);
   if (r.target_dir != null) sub.target_dir = String(r.target_dir);
   if (r.next_check_at != null) sub.next_check_at = Number(r.next_check_at);
   if (r.last_checked_at != null) sub.last_checked_at = Number(r.last_checked_at);
@@ -587,7 +612,8 @@ function rowToTask(r: Row): DriverTask {
 
 const SUB_COLUMNS = [
   "id", "title", "original_title", "year", "tmdb_id", "media_type", "region",
-  "season", "total_episodes", "quality_pref", "mode", "status", "target_dir",
+  "season", "total_episodes", "quality_pref", "poster_path", "overview", "rating",
+  "mode", "status", "target_dir",
   "next_check_at", "last_checked_at", "last_error", "created_at", "updated_at",
 ] as const;
 
@@ -595,7 +621,8 @@ function subValues(s: Subscription): unknown[] {
   return [
     s.id, s.title, s.original_title ?? null, s.year ?? null, s.tmdb_id ?? null,
     s.media_type, s.region ?? null, s.season ?? null, s.total_episodes ?? null,
-    s.quality_pref ?? null, s.mode, s.status, s.target_dir ?? null,
+    s.quality_pref ?? null, s.poster_path ?? null, s.overview ?? null, s.rating ?? null,
+    s.mode, s.status, s.target_dir ?? null,
     s.next_check_at ?? null, s.last_checked_at ?? null, s.last_error ?? null,
     s.created_at, s.updated_at,
   ];
@@ -773,6 +800,20 @@ class D1Store implements Store {
     });
   }
 
+  async getStoredCounts(): Promise<{ subscription_id: string; season: number; count: number }[]> {
+    const res = await this.db
+      .prepare(
+        `SELECT subscription_id, season, COUNT(*) AS n FROM episodes
+         WHERE status = 'stored' GROUP BY subscription_id, season`,
+      )
+      .all<Row>();
+    return res.results.map((r) => ({
+      subscription_id: String(r.subscription_id),
+      season: Number(r.season),
+      count: Number(r.n),
+    }));
+  }
+
   async addLog(entry: { subscription_id?: string; driver_id?: string; level: string; event: string; detail?: string }): Promise<void> {
     await this.db
       .prepare("INSERT INTO logs (id, subscription_id, driver_id, level, event, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
@@ -830,6 +871,9 @@ async function handleCreateSub(req: Request, store: Store): Promise<Response> {
     season: input.season,
     total_episodes: input.total_episodes,
     quality_pref: input.quality_pref,
+    poster_path: typeof input.poster_path === "string" && input.poster_path ? input.poster_path : undefined,
+    overview: typeof input.overview === "string" && input.overview ? input.overview : undefined,
+    rating: typeof input.rating === "number" && Number.isFinite(input.rating) ? input.rating : undefined,
     mode: input.mode ?? "manual",
     status: "pending_search",
     target_dir: input.target_dir, // TODO: derive from §3 directory rules when absent
@@ -852,8 +896,8 @@ async function handlePatchSub(req: Request, store: Store, id: string): Promise<R
   const patch = await body<Partial<Subscription>>(req);
   if (!patch) return err("bad_request", "invalid JSON body", 400);
   // Whitelist mutable fields so clients cannot rewrite ids/timestamps.
-  const { status, mode, quality_pref, region, season, total_episodes, target_dir, next_check_at, tmdb_id, year } = patch;
-  const clean: Partial<Subscription> = { status, mode, quality_pref, region, season, total_episodes, target_dir, next_check_at, tmdb_id, year };
+  const { status, mode, quality_pref, region, season, total_episodes, target_dir, next_check_at, tmdb_id, year, poster_path, overview, rating } = patch;
+  const clean: Partial<Subscription> = { status, mode, quality_pref, region, season, total_episodes, target_dir, next_check_at, tmdb_id, year, poster_path, overview, rating };
   for (const k of Object.keys(clean) as (keyof typeof clean)[]) if (clean[k] === undefined) delete clean[k];
   const sub = await store.updateSubscription(id, clean);
   return sub ? json({ subscription: sub }) : err("not_found", "subscription not found", 404);
@@ -863,6 +907,45 @@ async function handleDeleteSub(store: Store, id: string): Promise<Response> {
   return (await store.deleteSubscription(id))
     ? json({ deleted: true })
     : err("not_found", "subscription not found", 404);
+}
+
+const FINISHED_STATUSES: SubStatus[] = ["completed", "ended"];
+const ACTIVE_STATUSES: SubStatus[] = [
+  "subscribed", "pending_search", "searching", "candidates_ready",
+  "awaiting_confirm", "transferring", "verifying", "partial_stored", "error",
+];
+
+/** Stored count for one subscription: its tracked season when set, else all seasons. */
+function storedForSub(
+  counts: { subscription_id: string; season: number; count: number }[],
+  sub: Subscription,
+): number {
+  return counts
+    .filter((c) => c.subscription_id === sub.id && (sub.season == null || c.season === sub.season))
+    .reduce((sum, c) => sum + c.count, 0);
+}
+
+/** GET /api/stats — dashboard aggregates + per-subscription stored counts. */
+async function handleStats(store: Store): Promise<Response> {
+  const subs = await store.listSubscriptions();
+  const counts = await store.getStoredCounts();
+  const storedBySubscription: Record<string, number> = {};
+  let storedEpisodes = 0;
+  for (const sub of subs) {
+    const n = storedForSub(counts, sub);
+    storedBySubscription[sub.id] = n;
+    storedEpisodes += n;
+  }
+  return json({
+    stats: {
+      total_subscriptions: subs.length,
+      following: subs.filter((s) => ACTIVE_STATUSES.includes(s.status)).length,
+      finished: subs.filter((s) => FINISHED_STATUSES.includes(s.status)).length,
+      paused: subs.filter((s) => s.status === "paused").length,
+      stored_episodes: storedEpisodes,
+      stored_by_subscription: storedBySubscription,
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1202,6 +1285,8 @@ async function handleTmdbSearch(url: URL, store: Store): Promise<Response> {
         origin_country: countries,
         region: mapRegion(countries[0], mediaType),
         poster_url: tmdbPoster(r.poster_path),
+        poster_path: typeof r.poster_path === "string" && r.poster_path ? r.poster_path : undefined,
+        rating: typeof r.vote_average === "number" ? r.vote_average : undefined,
         overview: typeof r.overview === "string" ? r.overview : undefined,
       };
     });
@@ -1233,6 +1318,8 @@ async function handleTmdbDetails(url: URL, store: Store): Promise<Response> {
     region: mapRegion(countries[0], type as MediaType),
     genres,
     poster_url: tmdbPoster(r.poster_path),
+    poster_path: typeof r.poster_path === "string" && r.poster_path ? r.poster_path : undefined,
+    rating: typeof r.vote_average === "number" ? r.vote_average : undefined,
     overview: typeof r.overview === "string" ? r.overview : undefined,
     status: typeof r.status === "string" ? r.status : undefined,
   };
@@ -1260,25 +1347,255 @@ async function handleTmdbDetails(url: URL, store: Store): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// Pages
+// Pages — v0.4 MoviePilot-style dark SPA (layout/interaction inspired by
+// MoviePilot; all code and CSS below are an independent implementation,
+// no GPL code or assets are reused).
 // ---------------------------------------------------------------------------
 
-const PAGE_CSS = `
-  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 920px; padding: 0 1rem; }
-  nav { display: flex; gap: 1rem; align-items: baseline; margin-bottom: 1rem; }
-  nav h1 { font-size: 1.3rem; margin: 0; margin-right: auto; }
-  table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
-  th, td { border: 1px solid #ddd; padding: .45rem .6rem; text-align: left; font-size: .92rem; }
-  form.inline { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: 1rem; }
-  input, select, button { padding: .45rem .6rem; font-size: .95rem; }
-  .muted { color: #666; font-size: .88rem; }
-  .error { color: #b00020; }
-  .tmdb-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: .8rem; margin-top: 1rem; }
-  .tmdb-card { border: 1px solid #ddd; border-radius: 8px; padding: .5rem; cursor: pointer; }
-  .tmdb-card:hover { border-color: #888; }
-  .tmdb-card img { width: 100%; border-radius: 4px; }
-  .tmdb-card .t { font-weight: 600; font-size: .92rem; margin-top: .4rem; }
-  section { margin-top: 2rem; }
+const APP_CSS = `
+  :root {
+    --pp-bg: #0d1017;
+    --pp-bg-soft: #12151f;
+    --pp-panel: #171b28;
+    --pp-panel-2: #1d2233;
+    --pp-border: #262c40;
+    --pp-text: #e8eaf2;
+    --pp-muted: #9aa3b8;
+    --pp-accent: #6d6df2;
+    --pp-accent-2: #9d6bf5;
+    --pp-grad: linear-gradient(135deg, #5b6cff 0%, #9d6bf5 100%);
+    --pp-green: #34c98e;
+    --pp-amber: #f0b35c;
+    --pp-red: #f26d6d;
+    --pp-gray: #8a93a8;
+    --pp-radius: 14px;
+    --pp-shadow: 0 10px 28px rgba(0, 0, 0, .38);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--pp-bg);
+    color: var(--pp-text);
+    min-height: 100vh;
+  }
+  a { color: var(--pp-accent-2); text-decoration: none; }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  input, select {
+    background: var(--pp-bg-soft);
+    border: 1px solid var(--pp-border);
+    border-radius: 10px;
+    padding: .55rem .7rem;
+    outline: none;
+  }
+  input:focus, select:focus { border-color: var(--pp-accent); }
+  input::placeholder { color: #5d6577; }
+  .btn {
+    border: 1px solid var(--pp-border);
+    background: var(--pp-panel-2);
+    border-radius: 10px;
+    padding: .5rem .95rem;
+    cursor: pointer;
+    transition: filter .15s, background .15s;
+  }
+  .btn:hover { filter: brightness(1.18); }
+  .btn-primary { background: var(--pp-grad); border: none; color: #fff; font-weight: 600; }
+  .btn-ghost { background: transparent; }
+  .btn-danger { background: transparent; border-color: rgba(242, 109, 109, .45); color: var(--pp-red); }
+  .muted { color: var(--pp-muted); font-size: .88rem; line-height: 1.55; }
+  .error-text { color: var(--pp-red); font-size: .9rem; }
+
+  /* ---- layout: fixed dark sidebar + main column ---- */
+  .layout { display: flex; min-height: 100vh; }
+  .sidebar {
+    width: 232px; flex: 0 0 232px;
+    background: var(--pp-bg-soft);
+    border-right: 1px solid var(--pp-border);
+    display: flex; flex-direction: column;
+    padding: 1.1rem .9rem;
+    position: sticky; top: 0; height: 100vh;
+  }
+  .brand { display: flex; align-items: center; gap: .65rem; padding: .2rem .4rem 1.1rem; }
+  .brand-logo {
+    width: 38px; height: 38px; border-radius: 11px;
+    background: var(--pp-grad); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 1.15rem; box-shadow: var(--pp-shadow);
+  }
+  .brand-name { font-size: 1.18rem; font-weight: 700; letter-spacing: .02em; }
+  .brand-sub { font-size: .72rem; color: var(--pp-muted); }
+  .menu { display: flex; flex-direction: column; gap: .3rem; margin-top: .4rem; }
+  .menu-item {
+    display: flex; align-items: center; gap: .6rem;
+    background: transparent; border: none; border-radius: 10px;
+    padding: .62rem .7rem; cursor: pointer; text-align: left;
+    color: var(--pp-muted); font-size: .97rem;
+  }
+  .menu-item svg { flex: 0 0 auto; opacity: .85; }
+  .menu-item:hover { background: var(--pp-panel); color: var(--pp-text); }
+  .menu-item.active { background: var(--pp-panel-2); color: #fff; box-shadow: inset 3px 0 0 var(--pp-accent); }
+  .sidebar-foot { margin-top: auto; border-top: 1px solid var(--pp-border); padding-top: .9rem; }
+  .side-user { font-size: .88rem; color: var(--pp-muted); padding: 0 .4rem .55rem; word-break: break-all; }
+  .logout-btn {
+    width: 100%; background: transparent; border: 1px solid var(--pp-border);
+    border-radius: 10px; padding: .5rem; cursor: pointer; color: var(--pp-muted);
+  }
+  .logout-btn:hover { color: var(--pp-text); border-color: var(--pp-accent); }
+  .main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+  .topbar {
+    display: flex; align-items: center; gap: 1rem;
+    padding: 1rem 1.6rem; border-bottom: 1px solid var(--pp-border);
+    background: rgba(13, 16, 23, .85); position: sticky; top: 0; z-index: 5;
+    backdrop-filter: blur(6px);
+  }
+  .page-title { font-size: 1.25rem; font-weight: 700; margin-right: auto; }
+  .topbar-user { color: var(--pp-muted); font-size: .9rem; }
+  .content { padding: 1.4rem 1.6rem 2.4rem; max-width: 1240px; width: 100%; margin: 0 auto; }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* ---- cards & stats ---- */
+  .card {
+    background: var(--pp-panel); border: 1px solid var(--pp-border);
+    border-radius: var(--pp-radius); box-shadow: var(--pp-shadow);
+    padding: 1.15rem 1.25rem; margin-bottom: 1.2rem;
+  }
+  .card h2 { margin: 0 0 .55rem; font-size: 1.05rem; }
+  .card h3 { margin: 0 0 .55rem; font-size: .98rem; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1.2rem; }
+  .stat-card {
+    background: var(--pp-panel); border: 1px solid var(--pp-border);
+    border-radius: var(--pp-radius); box-shadow: var(--pp-shadow);
+    padding: 1.05rem 1.2rem;
+  }
+  .stat-label { color: var(--pp-muted); font-size: .86rem; }
+  .stat-value { font-size: 1.9rem; font-weight: 750; margin-top: .3rem; }
+  .stat-value .unit { font-size: .9rem; color: var(--pp-muted); font-weight: 500; }
+  form.inline { display: flex; flex-wrap: wrap; gap: .55rem; align-items: center; margin-top: .7rem; }
+
+  /* ---- subscription poster wall ---- */
+  .sub-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; }
+  .sub-card {
+    display: flex; gap: .95rem;
+    background: var(--pp-panel); border: 1px solid var(--pp-border);
+    border-radius: var(--pp-radius); box-shadow: var(--pp-shadow);
+    padding: .9rem;
+  }
+  .poster { width: 92px; height: 138px; object-fit: cover; border-radius: 9px; flex: 0 0 auto; background: var(--pp-panel-2); }
+  .poster-ph {
+    display: flex; align-items: center; justify-content: center;
+    font-size: 2rem; font-weight: 700; color: var(--pp-muted);
+    background: linear-gradient(160deg, var(--pp-panel-2), var(--pp-bg-soft));
+  }
+  .sub-body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
+  .sub-title { font-weight: 650; font-size: 1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub-year { color: var(--pp-muted); font-weight: 500; font-size: .88rem; }
+  .tag-row { display: flex; flex-wrap: wrap; gap: .35rem; margin: .45rem 0 .55rem; }
+  .tag {
+    font-size: .74rem; color: var(--pp-muted);
+    border: 1px solid var(--pp-border); border-radius: 999px; padding: .08rem .5rem;
+  }
+  .tag-rate { color: var(--pp-amber); border-color: rgba(240, 179, 92, .4); }
+  .progress { height: 7px; border-radius: 999px; background: var(--pp-bg-soft); overflow: hidden; }
+  .progress-bar { height: 100%; background: var(--pp-grad); border-radius: 999px; }
+  .sub-meta { display: flex; align-items: center; justify-content: space-between; gap: .5rem; margin-top: .5rem; font-size: .85rem; color: var(--pp-muted); }
+  .sub-next { font-size: .78rem; color: var(--pp-muted); margin-top: .3rem; }
+  .sub-actions { display: flex; gap: .5rem; margin-top: auto; padding-top: .6rem; }
+  .sub-actions .btn { padding: .38rem .8rem; font-size: .86rem; }
+  .badge { font-size: .76rem; border-radius: 999px; padding: .14rem .55rem; white-space: nowrap; }
+  .b-active { background: rgba(109, 109, 242, .18); color: #a5a5ff; }
+  .b-partial { background: rgba(240, 179, 92, .16); color: var(--pp-amber); }
+  .b-done { background: rgba(52, 201, 142, .15); color: var(--pp-green); }
+  .b-paused { background: rgba(138, 147, 168, .16); color: var(--pp-gray); }
+  .b-error { background: rgba(242, 109, 109, .15); color: var(--pp-red); }
+
+  /* ---- recent list (dashboard) ---- */
+  .recent-row {
+    display: flex; align-items: center; gap: .85rem;
+    padding: .55rem 0; border-bottom: 1px solid var(--pp-border);
+  }
+  .recent-row:last-child { border-bottom: none; }
+  .recent-row img, .recent-row .poster-ph { width: 40px; height: 60px; border-radius: 6px; object-fit: cover; font-size: 1rem; }
+  .recent-main { flex: 1 1 auto; min-width: 0; }
+  .recent-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .recent-sub { color: var(--pp-muted); font-size: .8rem; margin-top: .15rem; }
+
+  /* ---- discover / TMDB grid ---- */
+  .tmdb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: .9rem; margin-top: 1rem; }
+  .tmdb-card {
+    background: var(--pp-panel); border: 1px solid var(--pp-border);
+    border-radius: 12px; overflow: hidden; cursor: pointer;
+    transition: transform .12s, border-color .12s;
+  }
+  .tmdb-card:hover { transform: translateY(-2px); border-color: var(--pp-accent); }
+  .tmdb-card img { width: 100%; aspect-ratio: 2 / 3; object-fit: cover; display: block; background: var(--pp-panel-2); }
+  .tmdb-card .poster-ph { width: 100%; aspect-ratio: 2 / 3; height: auto; border-radius: 0; }
+  .tmdb-info { padding: .55rem .65rem .7rem; }
+  .tmdb-info .t { font-weight: 600; font-size: .92rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tmdb-info .m { color: var(--pp-muted); font-size: .78rem; margin-top: .2rem; }
+  .guide-card { border-color: rgba(240, 179, 92, .5); }
+
+  /* ---- modal ---- */
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(4, 6, 10, .66);
+    display: flex; align-items: center; justify-content: center;
+    padding: 1rem; z-index: 50;
+  }
+  .modal-backdrop[hidden] { display: none; }
+  .modal {
+    background: var(--pp-panel); border: 1px solid var(--pp-border);
+    border-radius: 16px; box-shadow: var(--pp-shadow);
+    max-width: 640px; width: 100%; max-height: 90vh; overflow: auto; padding: 1.3rem;
+  }
+  .modal-head { display: flex; gap: 1.1rem; }
+  .modal-head img, .modal-head .poster-ph { width: 120px; height: 180px; border-radius: 10px; object-fit: cover; }
+  .modal-head .poster-ph { font-size: 2.4rem; }
+  .modal-actions { display: flex; gap: .6rem; justify-content: flex-end; margin-top: 1.1rem; }
+  .overview { color: var(--pp-muted); font-size: .9rem; line-height: 1.65; margin-top: .8rem;
+    display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow: hidden; }
+
+  /* ---- login ---- */
+  .login-wrap {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    padding: 1.2rem;
+    background:
+      radial-gradient(720px 420px at 18% 12%, rgba(91, 108, 255, .22), transparent 60%),
+      radial-gradient(640px 420px at 85% 88%, rgba(157, 107, 245, .18), transparent 60%),
+      var(--pp-bg);
+  }
+  .login-card {
+    width: 100%; max-width: 392px;
+    background: var(--pp-panel); border: 1px solid var(--pp-border);
+    border-radius: 18px; box-shadow: var(--pp-shadow);
+    padding: 2rem 1.8rem 1.6rem;
+  }
+  .login-brand { display: flex; flex-direction: column; align-items: center; gap: .55rem; margin-bottom: 1.4rem; text-align: center; }
+  .login-brand .brand-logo { width: 52px; height: 52px; border-radius: 14px; font-size: 1.5rem; }
+  .login-card form { display: flex; flex-direction: column; gap: .7rem; }
+  .login-card input { padding: .68rem .8rem; }
+  .login-card .btn-primary { padding: .68rem; margin-top: .2rem; }
+  .login-foot { text-align: center; margin-top: 1.1rem; }
+
+  /* ---- responsive: sidebar collapses to a top bar ---- */
+  @media (max-width: 880px) {
+    .layout { flex-direction: column; }
+    .sidebar {
+      width: 100%; flex: none; height: auto; position: static;
+      flex-direction: row; flex-wrap: wrap; align-items: center;
+      padding: .6rem .8rem; gap: .5rem;
+    }
+    .brand { padding: 0; margin-right: auto; }
+    .brand-sub { display: none; }
+    .menu { flex-direction: row; flex-wrap: wrap; margin-top: 0; }
+    .menu-item { padding: .45rem .6rem; }
+    .menu-item.active { box-shadow: inset 0 -3px 0 var(--pp-accent); }
+    .sidebar-foot { margin: 0; border: none; padding: 0; display: flex; align-items: center; gap: .6rem; }
+    .side-user { padding: 0; }
+    .logout-btn { width: auto; padding: .4rem .7rem; }
+    .content { padding: 1rem .9rem 2rem; }
+    .topbar { padding: .8rem 1rem; }
+    .sub-grid { grid-template-columns: 1fr; }
+  }
 `;
 
 function LOGIN_HTML(failed: boolean): string {
@@ -1288,336 +1605,524 @@ function LOGIN_HTML(failed: boolean): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PanPilot 登录</title>
-<style>${PAGE_CSS}</style>
+<style>${APP_CSS}</style>
 </head>
 <body>
-<h1>PanPilot 登录</h1>
-${failed ? '<p class="error">用户名或密码不正确，请重试。</p>' : ""}
-<form method="post" action="/login" class="inline">
-  <input name="username" placeholder="用户名" autocomplete="username" required>
-  <input name="password" type="password" placeholder="密码" autocomplete="current-password" required>
-  <button type="submit">登录</button>
-</form>
-<p class="muted">订阅控制面。搜索与转存由外部 Driver 执行，本站不保存任何网盘 Cookie。</p>
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="login-brand">
+      <div class="brand-logo">P</div>
+      <div class="brand-name" style="font-size:1.35rem">PanPilot</div>
+      <div class="brand-sub">影视订阅控制台</div>
+    </div>
+    ${failed ? '<p class="error-text">用户名或密码不正确，请重试。</p>' : ""}
+    <form method="post" action="/login">
+      <input name="username" placeholder="用户名" autocomplete="username" required>
+      <input name="password" type="password" placeholder="密码" autocomplete="current-password" required>
+      <button type="submit" class="btn btn-primary">登录</button>
+    </form>
+    <p class="muted login-foot">订阅控制面。搜索与转存由外部 Driver 执行，本站不保存任何网盘 Cookie。</p>
+  </div>
+</div>
 </body>
 </html>`;
 }
 
-const PAGE_HTML = `<!DOCTYPE html>
+// Small inline icons (own simple SVG paths, currentColor).
+const ICON_DASH = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>';
+const ICON_SUBS = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 4v5"/></svg>';
+const ICON_FIND = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15.5 8.5l-2 5-5 2 2-5z"/></svg>';
+const ICON_GEAR = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v3M12 18.2v3M2.8 12h3M18.2 12h3M5.5 5.5l2.1 2.1M16.4 16.4l2.1 2.1M18.5 5.5l-2.1 2.1M7.6 16.4l-2.1 2.1"/></svg>';
+
+function appHtml(initialView: string): string {
+  return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PanPilot 订阅</title>
-<style>${PAGE_CSS}</style>
+<title>PanPilot</title>
+<style>${APP_CSS}</style>
 </head>
-<body>
-<nav>
-  <h1>PanPilot 订阅</h1>
-  <a href="/">订阅</a>
-  <a href="/settings">设置</a>
-  <form method="post" action="/logout" style="display:inline"><button type="submit">退出登录</button></form>
-</nav>
-<p class="muted">订阅控制面。搜索与转存由外部 Driver 每 6 小时一轮执行；本页只管理订阅与进度。订阅绑定 TMDB ID（参考 MoviePilot），后续按季追踪。</p>
+<body data-initial-view="${initialView}">
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-logo">P</div>
+      <div>
+        <div class="brand-name">PanPilot</div>
+        <div class="brand-sub">影视订阅控制台</div>
+      </div>
+    </div>
+    <nav class="menu">
+      <button class="menu-item" data-nav="dashboard">${ICON_DASH}<span>仪表盘</span></button>
+      <button class="menu-item" data-nav="subscriptions">${ICON_SUBS}<span>我的订阅</span></button>
+      <button class="menu-item" data-nav="discover">${ICON_FIND}<span>发现</span></button>
+      <button class="menu-item" data-nav="settings">${ICON_GEAR}<span>设置</span></button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="side-user" id="side-user"></div>
+      <form method="post" action="/logout"><button class="logout-btn" type="submit">退出登录</button></form>
+    </div>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <div class="page-title" id="page-title">仪表盘</div>
+      <div class="topbar-user" id="topbar-user"></div>
+    </header>
+    <main class="content">
 
-<section>
-  <h2>从 TMDB 选剧</h2>
-  <form class="inline" id="tmdb-form">
-    <input id="tmdb-q" placeholder="输入剧名，如 谷雨" style="min-width:220px">
-    <button type="submit">搜索 TMDB</button>
-  </form>
-  <p class="muted">需要在「设置」页先配置 TMDB API Key；未配置时可直接用下方表单手动填写订阅。综艺在 TMDB 中属于 tv 类型，选中后可在表单里把类型改成「综艺」。</p>
-  <div id="tmdb-results" class="tmdb-results"></div>
-</section>
+      <section class="view" id="view-dashboard">
+        <div class="stat-grid">
+          <div class="stat-card"><div class="stat-label">订阅总数</div><div class="stat-value" id="stat-total">–</div></div>
+          <div class="stat-card"><div class="stat-label">追更中</div><div class="stat-value" id="stat-following">–</div></div>
+          <div class="stat-card"><div class="stat-label">已完结 / 集齐</div><div class="stat-value" id="stat-finished">–</div></div>
+          <div class="stat-card"><div class="stat-label">已入库集数</div><div class="stat-value" id="stat-stored">–</div></div>
+        </div>
+        <div class="card">
+          <h2>最近更新的订阅</h2>
+          <div id="recent-list"><p class="muted">加载中…</p></div>
+        </div>
+        <p class="muted">搜索与转存由外部 Driver 每 6 小时一轮执行；本页只管理订阅与进度。订阅绑定 TMDB ID（参考 MoviePilot），后续按季追踪。</p>
+      </section>
 
-<section>
-  <h2>添加订阅</h2>
-  <form id="add-form" class="inline">
-    <input name="title" id="f-title" placeholder="剧名 *" required>
-    <input name="year" id="f-year" type="number" placeholder="年份" min="1900" max="2100">
-    <select name="media_type" id="f-media_type">
-      <option value="tv">电视剧</option>
-      <option value="movie">电影</option>
-      <option value="variety">综艺</option>
-    </select>
-    <input name="region" id="f-region" placeholder="地区，如 国产剧">
-    <input name="season" id="f-season" type="number" placeholder="季" min="0">
-    <select id="tmdb-season" style="display:none"></select>
-    <input name="total_episodes" id="f-total_episodes" type="number" placeholder="总集数" min="1">
-    <select name="mode">
-      <option value="manual">手动确认</option>
-      <option value="auto">自动转存</option>
-    </select>
-    <input type="hidden" name="tmdb_id" id="f-tmdb_id">
-    <input type="hidden" name="original_title" id="f-original_title">
-    <button type="submit">添加订阅</button>
-  </form>
-  <p class="muted" id="tmdb-picked"></p>
-</section>
+      <section class="view" id="view-subscriptions">
+        <div class="sub-grid" id="sub-grid"><p class="muted">加载中…</p></div>
+      </section>
 
-<section>
-  <h2>我的订阅</h2>
-  <table>
-    <thead><tr><th>剧名</th><th>年份</th><th>类型/地区</th><th>季</th><th>总集数</th><th>模式</th><th>状态</th><th>下次检查</th><th></th></tr></thead>
-    <tbody id="rows"><tr><td colspan="9" class="muted">加载中…</td></tr></tbody>
-  </table>
-</section>
+      <section class="view" id="view-discover">
+        <div class="card">
+          <h2>从 TMDB 选剧</h2>
+          <form class="inline" id="tmdb-form">
+            <input id="tmdb-q" placeholder="输入剧名，如 谷雨" style="min-width:240px;flex:1">
+            <button type="submit" class="btn btn-primary">搜索 TMDB</button>
+          </form>
+          <p class="muted">点搜索结果可看详情并按季订阅。综艺在 TMDB 中属于 tv 类型，订阅后可在下方手动表单里把类型改成「综艺」重新添加。</p>
+          <div id="tmdb-guide"></div>
+          <div id="tmdb-results" class="tmdb-grid"></div>
+        </div>
+        <div class="card">
+          <h2>手动添加订阅</h2>
+          <p class="muted">TMDB 未配置或搜不到时，可直接填写。带海报的订阅请从上方搜索订阅。</p>
+          <form id="add-form" class="inline">
+            <input name="title" id="f-title" placeholder="剧名 *" required>
+            <input name="year" id="f-year" type="number" placeholder="年份" min="1900" max="2100" style="width:100px">
+            <select name="media_type" id="f-media_type">
+              <option value="tv">电视剧</option>
+              <option value="movie">电影</option>
+              <option value="variety">综艺</option>
+            </select>
+            <input name="region" id="f-region" placeholder="地区，如 国产剧">
+            <input name="season" id="f-season" type="number" placeholder="季" min="0" style="width:80px">
+            <input name="total_episodes" id="f-total_episodes" type="number" placeholder="总集数" min="1" style="width:100px">
+            <select name="mode" id="f-mode">
+              <option value="manual">手动确认</option>
+              <option value="auto">自动转存</option>
+            </select>
+            <button type="submit" class="btn btn-primary">添加订阅</button>
+          </form>
+        </div>
+      </section>
+
+      <section class="view" id="view-settings">
+        <div class="card">
+          <h2>TMDB</h2>
+          <p class="muted">TMDB API Key 保存在服务端设置中（页面只显示末 4 位掩码），用于发现页的选剧搜索与元数据回填。Key 在 themoviedb.org 免费申请。</p>
+          <p>当前状态：<span id="tmdb-status">加载中…</span></p>
+          <form id="tmdb-key-form" class="inline">
+            <input id="tmdb-key" placeholder="输入新的 TMDB API Key" style="min-width:320px;flex:1" autocomplete="off">
+            <button type="submit" class="btn btn-primary">保存</button>
+            <button type="button" class="btn" id="tmdb-clear">清除</button>
+          </form>
+        </div>
+        <div class="card">
+          <h2>登录账号</h2>
+          <p class="muted">当前登录用户名：<span id="account-username">…</span>（来源：<span id="account-source">…</span>）。初始账号密码来自部署时的 Secrets，在这里修改后以新账号为准（密码只存哈希）。修改须验证当前密码；保存后其他设备上的旧登录会失效，本浏览器会自动续上新登录。</p>
+          <form id="account-form" class="inline">
+            <input id="acc-current" type="password" placeholder="当前密码 *" autocomplete="current-password" required>
+            <input id="acc-username" placeholder="新用户名（不改可留空）" autocomplete="username">
+            <input id="acc-password" type="password" placeholder="新密码（不改可留空）" autocomplete="new-password">
+            <input id="acc-password2" type="password" placeholder="再输一次新密码" autocomplete="new-password">
+            <button type="submit" class="btn btn-primary">保存新账号</button>
+          </form>
+          <p id="account-msg" class="muted"></p>
+        </div>
+        <div class="card">
+          <h2>Driver</h2>
+          <p class="muted">Driver 检查间隔：<span id="interval">…</span> 小时一轮（由 Worker 环境变量 CHECK_INTERVAL_HOURS 控制，默认 6）。Driver API 使用独立 Bearer Token，与网页登录互不影响。</p>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <div id="modal-content"><p class="muted">加载中…</p></div>
+  </div>
+</div>
 
 <script>
-const rows = document.getElementById('rows');
+var VIEWS = ['dashboard', 'subscriptions', 'discover', 'settings'];
+var VIEW_TITLES = { dashboard: '仪表盘', subscriptions: '我的订阅', discover: '发现', settings: '设置' };
+var STATUS_LABEL = {
+  subscribed: '已订阅', pending_search: '待搜索', searching: '搜索中',
+  candidates_ready: '已找到候选', awaiting_confirm: '待确认', transferring: '转存中',
+  verifying: '复核中', partial_stored: '部分入库', completed: '已集齐',
+  ended: '已完结', paused: '已暂停', error: '出错'
+};
+var subsCache = [];
+var storedMap = {};
+
+function esc(s) {
+  var d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  return d.innerHTML;
+}
 function fmtTime(sec) {
-  if (!sec) return '';
+  if (!sec) return '—';
   return new Date(sec * 1000).toLocaleString();
 }
-async function load() {
-  const r = await fetch('/api/subscriptions');
-  if (r.status === 401) { location.href = '/login'; return; }
-  const data = await r.json();
-  const subs = data.subscriptions || [];
-  rows.innerHTML = subs.length ? '' : '<tr><td colspan="9" class="muted">暂无订阅</td></tr>';
-  for (const s of subs) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = '<td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td><button>删除</button></td>';
-    tr.children[0].textContent = s.title + (s.tmdb_id ? ' (TMDB ' + s.tmdb_id + ')' : '');
-    tr.children[1].textContent = s.year != null ? s.year : '';
-    tr.children[2].textContent = [s.media_type, s.region].filter(Boolean).join(' / ');
-    tr.children[3].textContent = s.season != null ? s.season : '';
-    tr.children[4].textContent = s.total_episodes != null ? s.total_episodes : '';
-    tr.children[5].textContent = s.mode;
-    tr.children[6].textContent = s.status;
-    tr.children[7].textContent = fmtTime(s.next_check_at);
-    tr.querySelector('button').onclick = async () => {
-      await fetch('/api/subscriptions/' + s.id, { method: 'DELETE' });
-      load();
-    };
-    rows.appendChild(tr);
-  }
+function mediaLabel(t) { return t === 'movie' ? '电影' : (t === 'variety' ? '综艺' : '电视剧'); }
+function statusClass(s) {
+  if (s === 'completed' || s === 'ended') return 'b-done';
+  if (s === 'partial_stored') return 'b-partial';
+  if (s === 'paused') return 'b-paused';
+  if (s === 'error') return 'b-error';
+  return 'b-active';
+}
+function badge(s) {
+  return '<span class="badge ' + statusClass(s) + '">' + esc(STATUS_LABEL[s] || s) + '</span>';
+}
+function posterUrl(p, size) { return p ? 'https://image.tmdb.org/t/p/' + (size || 'w342') + p : null; }
+function posterHtml(s, cls) {
+  var url = posterUrl(s.poster_path);
+  if (url) return '<img class="' + cls + '" src="' + url + '" alt="" loading="lazy">';
+  return '<div class="' + cls + ' poster-ph">' + esc((s.title || '?').slice(0, 1)) + '</div>';
+}
+async function api(path, opts) {
+  var r = await fetch(path, opts || {});
+  if (r.status === 401) { location.href = '/login'; throw new Error('unauthorized'); }
+  return r;
 }
 
-let pickedSeasons = [];
-const seasonSelect = document.getElementById('tmdb-season');
-seasonSelect.addEventListener('change', () => {
-  const s = pickedSeasons.find((x) => String(x.season) === seasonSelect.value);
-  if (s) {
-    document.getElementById('f-season').value = s.season;
-    document.getElementById('f-total_episodes').value = s.episode_count || '';
+function switchView(name) {
+  if (VIEWS.indexOf(name) < 0) name = 'dashboard';
+  for (var i = 0; i < VIEWS.length; i++) {
+    document.getElementById('view-' + VIEWS[i]).classList.toggle('active', VIEWS[i] === name);
   }
+  var items = document.querySelectorAll('.menu-item');
+  for (var j = 0; j < items.length; j++) {
+    items[j].classList.toggle('active', items[j].getAttribute('data-nav') === name);
+  }
+  document.getElementById('page-title').textContent = VIEW_TITLES[name];
+  if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
+}
+var navItems = document.querySelectorAll('.menu-item');
+for (var n = 0; n < navItems.length; n++) {
+  navItems[n].addEventListener('click', function () { switchView(this.getAttribute('data-nav')); });
+}
+
+/* ---------- subscriptions rendering ---------- */
+function progressOf(s) {
+  var stored = storedMap[s.id] || 0;
+  var total = s.total_episodes || 0;
+  var pct = total > 0 ? Math.min(100, Math.round(stored / total * 100)) : (stored > 0 ? 100 : 0);
+  var text = s.media_type === 'movie'
+    ? (stored > 0 ? '已入库' : '未入库')
+    : ('已入库 ' + stored + (total ? ' / ' + total + ' 集' : ' 集'));
+  return { stored: stored, total: total, pct: pct, text: text };
+}
+function subCard(s) {
+  var p = progressOf(s);
+  var tags = '<span class="tag">' + mediaLabel(s.media_type) + '</span>'
+    + (s.region ? '<span class="tag">' + esc(s.region) + '</span>' : '')
+    + (s.season != null && s.media_type !== 'movie' ? '<span class="tag">第 ' + s.season + ' 季</span>' : '')
+    + (s.rating ? '<span class="tag tag-rate">★ ' + Number(s.rating).toFixed(1) + '</span>' : '');
+  var pauseBtn = s.status === 'paused'
+    ? '<button class="btn btn-ghost" data-act="resume" data-id="' + s.id + '">恢复</button>'
+    : '<button class="btn btn-ghost" data-act="pause" data-id="' + s.id + '">暂停</button>';
+  return '<article class="sub-card">' + posterHtml(s, 'poster')
+    + '<div class="sub-body">'
+    + '<div class="sub-title">' + esc(s.title) + (s.year ? ' <span class="sub-year">' + s.year + '</span>' : '') + '</div>'
+    + '<div class="tag-row">' + tags + '</div>'
+    + '<div class="progress"><div class="progress-bar" style="width:' + p.pct + '%"></div></div>'
+    + '<div class="sub-meta"><span>' + p.text + '</span>' + badge(s.status) + '</div>'
+    + '<div class="sub-next">下次检查：' + fmtTime(s.next_check_at) + '</div>'
+    + '<div class="sub-actions">' + pauseBtn
+    + '<button class="btn btn-danger" data-act="delete" data-id="' + s.id + '">删除</button></div>'
+    + '</div></article>';
+}
+function renderSubs() {
+  var grid = document.getElementById('sub-grid');
+  grid.innerHTML = subsCache.length ? subsCache.map(subCard).join('') : '<p class="muted">暂无订阅，去「发现」页搜一部剧开始吧。</p>';
+}
+function renderDashboard(stats) {
+  document.getElementById('stat-total').textContent = stats.total_subscriptions;
+  document.getElementById('stat-following').textContent = stats.following;
+  document.getElementById('stat-finished').textContent = stats.finished;
+  document.getElementById('stat-stored').textContent = stats.stored_episodes;
+  var recent = subsCache.slice().sort(function (a, b) { return (b.updated_at || 0) - (a.updated_at || 0); }).slice(0, 6);
+  var box = document.getElementById('recent-list');
+  if (!recent.length) { box.innerHTML = '<p class="muted">暂无订阅。</p>'; return; }
+  box.innerHTML = recent.map(function (s) {
+    var p = progressOf(s);
+    return '<div class="recent-row">' + posterHtml(s, '')
+      + '<div class="recent-main"><div class="recent-title">' + esc(s.title)
+      + (s.year ? ' <span class="sub-year">' + s.year + '</span>' : '') + '</div>'
+      + '<div class="recent-sub">' + mediaLabel(s.media_type)
+      + (s.region ? ' · ' + esc(s.region) : '') + ' · ' + p.text + ' · 更新于 ' + fmtTime(s.updated_at) + '</div></div>'
+      + badge(s.status) + '</div>';
+  }).join('');
+}
+async function loadSubs() {
+  var r = await api('/api/subscriptions');
+  var data = await r.json();
+  subsCache = data.subscriptions || [];
+  var rs = await api('/api/stats');
+  var sd = await rs.json();
+  storedMap = (sd.stats && sd.stats.stored_by_subscription) || {};
+  renderSubs();
+  renderDashboard(sd.stats);
+}
+document.getElementById('sub-grid').addEventListener('click', async function (e) {
+  var btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  var id = btn.getAttribute('data-id');
+  var act = btn.getAttribute('data-act');
+  if (act === 'delete') {
+    if (!confirm('确定删除这个订阅吗？（只删订阅记录，不动网盘里的文件）')) return;
+    await api('/api/subscriptions/' + id, { method: 'DELETE' });
+  } else if (act === 'pause') {
+    await api('/api/subscriptions/' + id, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'paused' })
+    });
+  } else if (act === 'resume') {
+    await api('/api/subscriptions/' + id, {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'pending_search', next_check_at: Math.floor(Date.now() / 1000) })
+    });
+  }
+  loadSubs();
 });
 
-async function pickTmdb(item) {
-  const r = await fetch('/api/tmdb/details?type=' + encodeURIComponent(item.media_type) + '&id=' + item.tmdb_id);
-  const data = await r.json();
-  if (!r.ok) { alert(data.error ? data.error.message : '读取 TMDB 详情失败'); return; }
-  const d = data.details;
-  document.getElementById('f-title').value = d.title || '';
-  document.getElementById('f-year').value = d.year != null ? d.year : '';
-  document.getElementById('f-media_type').value = d.media_type === 'movie' ? 'movie' : 'tv';
-  document.getElementById('f-region').value = d.region || '';
-  document.getElementById('f-tmdb_id').value = d.tmdb_id;
-  document.getElementById('f-original_title').value = d.original_title || '';
-  pickedSeasons = d.seasons || [];
-  if (pickedSeasons.length) {
-    seasonSelect.innerHTML = '';
-    for (const s of pickedSeasons) {
-      const opt = document.createElement('option');
-      opt.value = s.season;
-      opt.textContent = '第 ' + s.season + ' 季（' + s.episode_count + ' 集）';
-      seasonSelect.appendChild(opt);
-    }
-    const regular = pickedSeasons.filter((x) => x.season >= 1);
-    const chosen = regular.length ? regular[regular.length - 1] : pickedSeasons[pickedSeasons.length - 1];
-    seasonSelect.value = String(chosen.season);
-    seasonSelect.style.display = '';
-    document.getElementById('f-season').value = chosen.season;
-    document.getElementById('f-total_episodes').value = chosen.episode_count || '';
-  } else {
-    seasonSelect.style.display = 'none';
-    document.getElementById('f-season').value = '';
-    document.getElementById('f-total_episodes').value = '';
+/* ---------- discover / TMDB ---------- */
+var modalItem = null;
+var modalDetails = null;
+function closeModal() { document.getElementById('modal-backdrop').hidden = true; }
+document.getElementById('modal-backdrop').addEventListener('click', function (e) {
+  if (e.target === this) closeModal();
+});
+
+async function openDetail(item) {
+  modalItem = item;
+  modalDetails = null;
+  var box = document.getElementById('modal-content');
+  box.innerHTML = '<p class="muted">加载详情中…</p>';
+  document.getElementById('modal-backdrop').hidden = false;
+  var r = await fetch('/api/tmdb/details?type=' + encodeURIComponent(item.media_type) + '&id=' + item.tmdb_id);
+  var data = await r.json().catch(function () { return null; });
+  if (!r.ok) {
+    box.innerHTML = '<p class="error-text">' + esc(data && data.error ? data.error.message : '读取 TMDB 详情失败') + '</p>'
+      + '<div class="modal-actions"><button class="btn" onclick="closeModal()">关闭</button></div>';
+    return;
   }
-  document.getElementById('tmdb-picked').textContent =
-    '已从 TMDB 回填：' + d.title + (d.year ? '（' + d.year + '）' : '') + ' · ' + (d.region || '') +
-    (d.genres && d.genres.length ? ' · ' + d.genres.join(' / ') : '') + '。核对后点「添加订阅」。';
-  document.getElementById('add-form').scrollIntoView({ behavior: 'smooth' });
+  var d = data.details;
+  modalDetails = d;
+  var poster = d.poster_path
+    ? '<img src="' + posterUrl(d.poster_path, 'w342') + '" alt="">'
+    : '<div class="poster-ph">' + esc((d.title || '?').slice(0, 1)) + '</div>';
+  var seasonOptions = '';
+  var seasons = (d.seasons || []).filter(function (s) { return s.season >= 1; });
+  for (var i = 0; i < seasons.length; i++) {
+    seasonOptions += '<option value="' + seasons[i].season + '" data-eps="' + seasons[i].episode_count + '">第 '
+      + seasons[i].season + ' 季（' + seasons[i].episode_count + ' 集）</option>';
+  }
+  var seasonRow = d.media_type === 'tv'
+    ? '<form class="inline"><label class="muted">订阅季</label><select id="m-season">' + seasonOptions + '</select>'
+      + '<label class="muted">模式</label><select id="m-mode"><option value="manual">手动确认</option><option value="auto">自动转存</option></select></form>'
+    : '<form class="inline"><label class="muted">模式</label><select id="m-mode"><option value="manual">手动确认</option><option value="auto">自动转存</option></select></form>';
+  box.innerHTML = '<div class="modal-head">' + poster
+    + '<div style="flex:1;min-width:0"><div style="font-size:1.15rem;font-weight:700">' + esc(d.title)
+    + (d.year ? ' <span class="sub-year">' + d.year + '</span>' : '') + '</div>'
+    + '<div class="tag-row"><span class="tag">' + (d.media_type === 'movie' ? '电影' : '电视剧') + '</span>'
+    + (d.region ? '<span class="tag">' + esc(d.region) + '</span>' : '')
+    + (d.rating ? '<span class="tag tag-rate">★ ' + Number(d.rating).toFixed(1) + '</span>' : '')
+    + (d.genres && d.genres.length ? '<span class="tag">' + esc(d.genres.join(' / ')) + '</span>' : '') + '</div>'
+    + seasonRow + '</div></div>'
+    + (d.overview ? '<p class="overview">' + esc(d.overview) + '</p>' : '')
+    + '<div class="modal-actions"><button class="btn" id="m-cancel">取消</button>'
+    + '<button class="btn btn-primary" id="m-subscribe">订阅</button></div>';
+  document.getElementById('m-cancel').addEventListener('click', closeModal);
+  document.getElementById('m-subscribe').addEventListener('click', subscribeFromModal);
 }
 
-document.getElementById('tmdb-form').addEventListener('submit', async (e) => {
+async function subscribeFromModal() {
+  var d = modalDetails;
+  if (!d) return;
+  var payload = {
+    title: d.title, original_title: d.original_title || undefined,
+    year: d.year, tmdb_id: d.tmdb_id, media_type: d.media_type,
+    region: d.region || undefined, mode: document.getElementById('m-mode').value,
+    poster_path: d.poster_path || undefined, overview: d.overview || undefined,
+    rating: typeof d.rating === 'number' ? d.rating : undefined
+  };
+  if (d.media_type === 'tv') {
+    var sel = document.getElementById('m-season');
+    if (sel) {
+      payload.season = Number(sel.value);
+      var opt = sel.options[sel.selectedIndex];
+      var eps = opt ? Number(opt.getAttribute('data-eps')) : 0;
+      if (eps) payload.total_episodes = eps;
+    }
+  }
+  var r = await fetch('/api/subscriptions', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  var data = await r.json().catch(function () { return null; });
+  if (!r.ok) { alert(data && data.error ? data.error.message : '订阅失败'); return; }
+  closeModal();
+  await loadSubs();
+  switchView('subscriptions');
+}
+
+document.getElementById('tmdb-form').addEventListener('submit', async function (e) {
   e.preventDefault();
-  const q = document.getElementById('tmdb-q').value.trim();
-  const box = document.getElementById('tmdb-results');
+  var q = document.getElementById('tmdb-q').value.trim();
+  var box = document.getElementById('tmdb-results');
+  var guide = document.getElementById('tmdb-guide');
   if (!q) return;
+  guide.innerHTML = '';
   box.innerHTML = '<p class="muted">搜索中…</p>';
-  const r = await fetch('/api/tmdb/search?q=' + encodeURIComponent(q));
-  const data = await r.json();
+  var r = await fetch('/api/tmdb/search?q=' + encodeURIComponent(q));
+  var data = await r.json().catch(function () { return null; });
   if (!r.ok) {
     box.innerHTML = '';
-    alert(data.error ? data.error.message : 'TMDB 搜索失败');
-    return;
-  }
-  box.innerHTML = '';
-  if (!data.results.length) box.innerHTML = '<p class="muted">没有找到结果，可手动填写订阅。</p>';
-  for (const item of data.results) {
-    const card = document.createElement('div');
-    card.className = 'tmdb-card';
-    if (item.poster_url) {
-      const img = document.createElement('img');
-      img.src = item.poster_url;
-      img.alt = item.title;
-      card.appendChild(img);
+    if (data && data.error && data.error.code === 'tmdb_not_configured') {
+      guide.innerHTML = '<div class="card guide-card"><h3>TMDB 还没有配置</h3>'
+        + '<p class="muted">选剧搜索需要先在「设置」页保存 TMDB API Key（themoviedb.org 免费申请）。配置好后回到这里搜索即可；也可以先用下方表单手动添加订阅。</p>'
+        + '<button class="btn btn-primary" id="guide-go-settings">去设置页配置</button></div>';
+      document.getElementById('guide-go-settings').addEventListener('click', function () { switchView('settings'); });
+    } else {
+      alert(data && data.error ? data.error.message : 'TMDB 搜索失败');
     }
-    const t = document.createElement('div');
-    t.className = 't';
-    t.textContent = item.title;
-    card.appendChild(t);
-    const meta = document.createElement('div');
-    meta.className = 'muted';
-    meta.textContent = [item.year, item.media_type === 'movie' ? '电影' : '电视剧',
-      (item.origin_country || []).join('/'), item.region].filter(Boolean).join(' · ');
-    card.appendChild(meta);
-    card.onclick = () => pickTmdb(item);
-    box.appendChild(card);
-  }
-});
-
-document.getElementById('add-form').addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const f = new FormData(e.target);
-  const payload = Object.fromEntries(f.entries());
-  for (const k of ['year', 'season', 'total_episodes', 'tmdb_id']) {
-    if (payload[k] === '' || payload[k] == null) delete payload[k];
-    else payload[k] = Number(payload[k]);
-  }
-  if (!payload.region) delete payload.region;
-  if (!payload.original_title) delete payload.original_title;
-  const r = await fetch('/api/subscriptions', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  if (!r.ok) {
-    const data = await r.json().catch(() => null);
-    alert(data && data.error ? data.error.message : '添加失败');
     return;
   }
-  e.target.reset();
-  document.getElementById('tmdb-picked').textContent = '';
-  seasonSelect.style.display = 'none';
-  load();
+  var results = data.results || [];
+  if (!results.length) { box.innerHTML = '<p class="muted">没有找到结果，可手动填写订阅。</p>'; return; }
+  box.innerHTML = results.map(function (item, idx) {
+    var poster = item.poster_path
+      ? '<img src="' + posterUrl(item.poster_path, 'w342') + '" alt="" loading="lazy">'
+      : '<div class="poster-ph">' + esc((item.title || '?').slice(0, 1)) + '</div>';
+    return '<div class="tmdb-card" data-idx="' + idx + '">' + poster
+      + '<div class="tmdb-info"><div class="t">' + esc(item.title) + '</div>'
+      + '<div class="m">' + [item.year, item.media_type === 'movie' ? '电影' : '电视剧',
+          item.rating ? '★ ' + Number(item.rating).toFixed(1) : '', item.region]
+          .filter(Boolean).join(' · ') + '</div></div></div>';
+  }).join('');
+  var cards = box.querySelectorAll('.tmdb-card');
+  for (var i = 0; i < cards.length; i++) {
+    cards[i].addEventListener('click', function () {
+      openDetail(results[Number(this.getAttribute('data-idx'))]);
+    });
+  }
 });
-load();
-</script>
-</body>
-</html>`;
 
-const SETTINGS_HTML = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>PanPilot 设置</title>
-<style>${PAGE_CSS}</style>
-</head>
-<body>
-<nav>
-  <h1>PanPilot 设置</h1>
-  <a href="/">订阅</a>
-  <a href="/settings">设置</a>
-  <form method="post" action="/logout" style="display:inline"><button type="submit">退出登录</button></form>
-</nav>
+document.getElementById('add-form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  var f = new FormData(e.target);
+  var payload = {};
+  f.forEach(function (v, k) { if (v !== '') payload[k] = v; });
+  var numKeys = ['year', 'season', 'total_episodes'];
+  for (var i = 0; i < numKeys.length; i++) {
+    if (payload[numKeys[i]] != null) payload[numKeys[i]] = Number(payload[numKeys[i]]);
+  }
+  var r = await fetch('/api/subscriptions', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  var data = await r.json().catch(function () { return null; });
+  if (!r.ok) { alert(data && data.error ? data.error.message : '添加失败'); return; }
+  e.target.reset();
+  await loadSubs();
+  switchView('subscriptions');
+});
 
-<section>
-  <h2>TMDB</h2>
-  <p class="muted">TMDB API Key 保存在服务端设置中（页面只显示末 4 位掩码），用于订阅页的选剧搜索与元数据回填。Key 在 themoviedb.org 免费申请。</p>
-  <p>当前状态：<span id="tmdb-status">加载中…</span></p>
-  <form id="tmdb-form" class="inline">
-    <input id="tmdb-key" placeholder="输入新的 TMDB API Key" style="min-width:320px" autocomplete="off">
-    <button type="submit">保存</button>
-    <button type="button" id="tmdb-clear">清除</button>
-  </form>
-</section>
-
-<section>
-  <h2>登录账号</h2>
-  <p class="muted">当前登录用户名：<span id="account-username">…</span>（来源：<span id="account-source">…</span>）。初始账号密码来自部署时的 Secrets，在这里修改后以新账号为准（密码只存哈希）。修改须验证当前密码；保存后其他设备上的旧登录会失效，本浏览器会自动续上新登录。</p>
-  <form id="account-form" class="inline">
-    <input id="acc-current" type="password" placeholder="当前密码 *" autocomplete="current-password" required>
-    <input id="acc-username" placeholder="新用户名（不改可留空）" autocomplete="username">
-    <input id="acc-password" type="password" placeholder="新密码（不改可留空）" autocomplete="new-password">
-    <input id="acc-password2" type="password" placeholder="再输一次新密码" autocomplete="new-password">
-    <button type="submit">保存新账号</button>
-  </form>
-  <p id="account-msg" class="muted"></p>
-</section>
-
-<section>
-  <h2>Driver</h2>
-  <p class="muted">Driver 检查间隔：<span id="interval">…</span> 小时一轮（由 Worker 环境变量 CHECK_INTERVAL_HOURS 控制，默认 6）。Driver API 使用独立 Bearer Token，与网页登录互不影响。</p>
-</section>
-
-<script>
+/* ---------- settings ---------- */
 async function loadSettings() {
-  const r = await fetch('/api/settings');
-  if (r.status === 401) { location.href = '/login'; return; }
-  const data = await r.json();
-  const t = data.settings.tmdb_api_key;
+  var r = await api('/api/settings');
+  var data = await r.json();
+  var t = data.settings.tmdb_api_key;
   document.getElementById('tmdb-status').textContent =
     t.configured ? '已配置（' + t.masked + '）' : '未配置 — 选剧搜索不可用，仍可手动填写订阅';
   document.getElementById('interval').textContent = data.settings.check_interval_hours;
-  const acc = data.settings.account;
+  var acc = data.settings.account;
+  var uname = acc ? acc.username : '';
   document.getElementById('account-username').textContent = acc ? acc.username : '（未配置）';
   document.getElementById('account-source').textContent = acc ? (acc.source === 'settings' ? '后台已修改' : '部署初始值') : '—';
+  document.getElementById('side-user').textContent = uname ? '当前账号：' + uname : '';
+  document.getElementById('topbar-user').textContent = uname || '';
 }
-document.getElementById('account-form').addEventListener('submit', async (e) => {
+document.getElementById('account-form').addEventListener('submit', async function (e) {
   e.preventDefault();
-  const msg = document.getElementById('account-msg');
-  const current = document.getElementById('acc-current').value;
-  const username = document.getElementById('acc-username').value.trim();
-  const pw1 = document.getElementById('acc-password').value;
-  const pw2 = document.getElementById('acc-password2').value;
+  var msg = document.getElementById('account-msg');
+  var current = document.getElementById('acc-current').value;
+  var username = document.getElementById('acc-username').value.trim();
+  var pw1 = document.getElementById('acc-password').value;
+  var pw2 = document.getElementById('acc-password2').value;
   if (!current) { msg.textContent = '请先输入当前密码'; return; }
   if (!username && !pw1) { msg.textContent = '新用户名和新密码至少填一个'; return; }
   if (pw1 !== pw2) { msg.textContent = '两次输入的新密码不一致'; return; }
-  const payload = { current_password: current };
+  var payload = { current_password: current };
   if (username) payload.new_username = username;
   if (pw1) payload.new_password = pw1;
-  const r = await fetch('/api/account', {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
+  var r = await fetch('/api/account', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload)
   });
-  const data = await r.json().catch(() => null);
+  var data = await r.json().catch(function () { return null; });
   if (!r.ok) { msg.textContent = data && data.error ? data.error.message : '保存失败'; return; }
   msg.textContent = '已保存：' + data.note;
   e.target.reset();
   loadSettings();
 });
-document.getElementById('tmdb-form').addEventListener('submit', async (e) => {
+document.getElementById('tmdb-key-form').addEventListener('submit', async function (e) {
   e.preventDefault();
-  const key = document.getElementById('tmdb-key').value.trim();
+  var key = document.getElementById('tmdb-key').value.trim();
   if (!key) { alert('请输入 TMDB API Key'); return; }
-  const r = await fetch('/api/settings', {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ tmdb_api_key: key }),
+  var r = await fetch('/api/settings', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ tmdb_api_key: key })
   });
-  const data = await r.json().catch(() => null);
+  var data = await r.json().catch(function () { return null; });
   if (!r.ok) { alert(data && data.error ? data.error.message : '保存失败'); return; }
   document.getElementById('tmdb-key').value = '';
   loadSettings();
 });
-document.getElementById('tmdb-clear').addEventListener('click', async () => {
-  const r = await fetch('/api/settings', {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ clear_tmdb_api_key: true }),
+document.getElementById('tmdb-clear').addEventListener('click', async function () {
+  var r = await fetch('/api/settings', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clear_tmdb_api_key: true })
   });
   if (!r.ok) { alert('清除失败'); return; }
   loadSettings();
 });
+
+/* ---------- init ---------- */
+var initial = document.body.getAttribute('data-initial-view') || 'dashboard';
+if (location.hash) {
+  var h = location.hash.slice(1);
+  if (VIEWS.indexOf(h) >= 0) initial = h;
+}
+switchView(initial);
 loadSettings();
+loadSubs();
 </script>
 </body>
 </html>`;
+}
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1662,10 +2167,16 @@ export default {
       if (denied) return denied;
 
       if (pathname === "/" || pathname === "/index.html") {
-        return new Response(PAGE_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
+        return new Response(appHtml("dashboard"), { headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+      if (pathname === "/subscriptions") {
+        return new Response(appHtml("subscriptions"), { headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+      if (pathname === "/discover") {
+        return new Response(appHtml("discover"), { headers: { "content-type": "text/html; charset=utf-8" } });
       }
       if (pathname === "/settings") {
-        return new Response(SETTINGS_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
+        return new Response(appHtml("settings"), { headers: { "content-type": "text/html; charset=utf-8" } });
       }
 
       if (pathname === "/api/subscriptions" || pathname.startsWith("/api/subscriptions/")) {
@@ -1680,6 +2191,8 @@ export default {
         }
         return err("not_found", "unknown subscriptions endpoint", 404);
       }
+
+      if (pathname === "/api/stats" && req.method === "GET") return handleStats(store);
 
       if (pathname === "/api/settings") {
         if (req.method === "GET") return handleGetSettings(store, env);

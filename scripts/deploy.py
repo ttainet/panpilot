@@ -8,7 +8,14 @@ api.cloudflare.com. Nothing secret is printed; generated secret values are
 only reported as "set".
 
 Usage:
-  python3 scripts/deploy.py [--step d1|bundle|upload|secrets|domain|toml|all]
+  python3 scripts/deploy.py [--step d1|migrate|bundle|upload|secrets|domain|toml|all]
+
+The `migrate` step applies every migrations/*.sql file (in filename order)
+against the existing database; statements that fail only because the object
+already exists (table/index already exists, duplicate column) are treated
+as already applied, so it is safe to re-run. Use it for schema updates on an
+already-deployed database — it does NOT touch secrets (DRIVER_TOKEN etc.
+keep their deployed values).
 
 State (the D1 uuid) is kept in scripts/deploy-state.json (git-ignored).
 The generated DRIVER_TOKEN is written to .driver-token (mode 600, git-ignored)
@@ -115,21 +122,49 @@ def step_d1() -> str:
     state["d1_uuid"] = uuid
     save_state(state)
 
-    # Apply migrations/0001_init.sql statement by statement via the query API.
-    with open(os.path.join(ROOT, "migrations", "0001_init.sql"), encoding="utf-8") as f:
-        sql_text = f.read()
-    # Strip `--` comments to end-of-line first: comment text may itself
-    # contain ';' (e.g. "-- JSON/text; NEVER store cookies"), which would
-    # otherwise corrupt the naive ';' statement split below.
-    lines = [ln.split("--", 1)[0] for ln in sql_text.splitlines()]
-    statements = [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
-    print(f"[d1] applying {len(statements)} migration statements")
-    for i, stmt in enumerate(statements, 1):
-        status, payload = api("POST", f"/accounts/{ACCOUNT_ID}/d1/database/{uuid}/query", {"sql": stmt})
-        if status != 200 or not payload.get("success"):
-            fail(f"d1-migration-{i}", status, payload)
-    print("[d1] migrations applied")
+    apply_all_migrations(uuid)
+    verify_tables(uuid)
+    return uuid
 
+
+def split_sql(sql_text: str) -> list[str]:
+    """Split a migration file into statements. `--` comments are stripped to
+    end-of-line first: comment text may itself contain ';' (e.g.
+    "-- JSON/text; NEVER store cookies"), which would otherwise corrupt the
+    naive ';' statement split."""
+    lines = [ln.split("--", 1)[0] for ln in sql_text.splitlines()]
+    return [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
+
+
+def _already_applied(payload) -> bool:
+    """True when a failed statement only failed because it was already applied
+    (table/index already exists, duplicate column name)."""
+    if not isinstance(payload, dict):
+        return False
+    text = json.dumps(payload.get("errors") or payload, ensure_ascii=False).lower()
+    return "already exists" in text or "duplicate column" in text
+
+
+def apply_all_migrations(uuid: str) -> None:
+    mig_dir = os.path.join(ROOT, "migrations")
+    files = sorted(f for f in os.listdir(mig_dir) if f.endswith(".sql"))
+    for fname in files:
+        with open(os.path.join(mig_dir, fname), encoding="utf-8") as f:
+            statements = split_sql(f.read())
+        print(f"[migrate] {fname}: {len(statements)} statements")
+        for i, stmt in enumerate(statements, 1):
+            status, payload = api(
+                "POST", f"/accounts/{ACCOUNT_ID}/d1/database/{uuid}/query", {"sql": stmt})
+            if status == 200 and payload.get("success"):
+                continue
+            if _already_applied(payload):
+                print(f"[migrate] {fname} stmt {i}: already applied, skipped")
+                continue
+            fail(f"migrate-{fname}-{i}", status, payload)
+    print("[migrate] all migrations applied")
+
+
+def verify_tables(uuid: str) -> None:
     status, payload = api(
         "POST", f"/accounts/{ACCOUNT_ID}/d1/database/{uuid}/query",
         {"sql": "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"},
@@ -142,7 +177,19 @@ def step_d1() -> str:
         print(f"[d1] FAILED: missing tables {sorted(missing)}; present: {sorted(names)}")
         sys.exit(1)
     print(f"[d1] verified tables: {sorted(EXPECTED_TABLES)}")
-    return uuid
+
+
+def step_migrate(uuid: str) -> None:
+    apply_all_migrations(uuid)
+    verify_tables(uuid)
+    # Spot-check the v0.4 columns exist (subscriptions.poster_path).
+    status, payload = api(
+        "POST", f"/accounts/{ACCOUNT_ID}/d1/database/{uuid}/query",
+        {"sql": "SELECT poster_path, overview, rating FROM subscriptions LIMIT 0"},
+    )
+    if status != 200 or not payload.get("success"):
+        fail("migrate-verify-columns", status, payload)
+    print("[migrate] verified subscriptions.poster_path / overview / rating columns")
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +366,7 @@ def step_toml(uuid: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--step", default="all",
-                    choices=["d1", "bundle", "upload", "secrets", "domain", "toml", "all"])
+                    choices=["d1", "migrate", "bundle", "upload", "secrets", "domain", "toml", "all"])
     args = ap.parse_args()
     state = load_state()
 
@@ -332,6 +379,8 @@ def main() -> None:
 
     if args.step in ("d1", "all"):
         uuid = step_d1()
+    if args.step == "migrate":
+        step_migrate(need_uuid())
     if args.step in ("bundle", "all"):
         bundle = step_bundle()
     if args.step in ("upload", "all"):

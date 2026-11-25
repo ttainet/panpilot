@@ -1,8 +1,13 @@
-# PanPilot 设计稿 v0.3（已部署上线）
+# PanPilot 设计稿 v0.4（已部署上线）
 
-> 状态：v0.3 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
-> 线上验证（health 为 store=d1、admin/admin 可登录、Driver Token 鉴权正常）；
-> 源码尚未推送 GitHub。本文档描述目标架构与接口契约。
+> 状态：v0.4 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
+> 线上验证（health 为 store=d1、登录与 Driver Token 鉴权正常）。本文档描述目标架构与接口契约。
+>
+> v0.4 变更：前端按 MoviePilot 风格重做为深色单页应用（左侧导航 + 仪表盘统计卡 +
+> 海报墙订阅卡片 + 发现页海报网格/详情弹窗 + 卡片式设置页；布局与交互为参考，
+> 代码与 CSS 全部独立实现，未使用 MoviePilot 的 GPL 代码/素材）；subscriptions 表
+> 新增 `poster_path` / `overview` / `rating` 三列（迁移 `0002_poster.sql`，TMDB 选剧时回填）；
+> 新增只读聚合接口 `GET /api/stats`（订阅总数/追更中/已完结/已入库集数 + 每订阅已入库数）。
 
 ## 1. 定位
 
@@ -84,6 +89,9 @@ PanPilot 是一个**影视订阅控制面**，部署在 Cloudflare Workers 上�
 | season | INTEGER | 目标季，电影为 NULL |
 | total_episodes | INTEGER | 该季总集数，可空（未知时由 Driver 回填） |
 | quality_pref | TEXT | 画质偏好 JSON，如 `["4K HDR","4K","1080p"]`，或 `match_existing` |
+| poster_path | TEXT | TMDB 海报路径（如 `/abc.jpg`），海报墙展示用；手动订阅可空（v0.4 新增） |
+| overview | TEXT | TMDB 简介，选剧时回填（v0.4 新增） |
+| rating | REAL | TMDB 评分（订阅时快照）（v0.4 新增） |
 | mode | TEXT NOT NULL | `manual`（找到候选等网页确认）\| `auto`（Driver 直接转存） |
 | status | TEXT NOT NULL | 状态机见 §5 |
 | target_dir | TEXT | 入库目标目录（按 §3 生成后落库，可人工改） |

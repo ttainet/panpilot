@@ -1,8 +1,9 @@
 # PanPilot
 
-> Status: v0.3 — **deployed 2026-11-25** via the Cloudflare API to https://panpilot.ttai.net
-> (verified live: D1 store, password login, Driver auth). Source not yet pushed to GitHub.
-> 状态：v0.3 — **已于 2026-11-25 经 Cloudflare API 部署上线**并完成线上验证；源码尚未推送 GitHub。设计见 [DESIGN.md](./DESIGN.md)。
+> Status: v0.4 — **deployed 2026-11-25** via the Cloudflare API to https://panpilot.ttai.net
+> (verified live: D1 store, password login, Driver auth); source is developed in the
+> public repository below.
+> 状态：v0.4 — **已于 2026-11-25 经 Cloudflare API 部署上线**并完成线上验证；源码在本仓库公开开发。设计见 [DESIGN.md](./DESIGN.md)。
 
 **Repository / 仓库：** https://github.com/ttainet/panpilot
 **Live / 正式域名：** https://panpilot.ttai.net
@@ -25,6 +26,28 @@ MoviePilot：用户只在网页上订阅电视剧/电影/综艺；搜索 TG 频�
 
 **The control plane never stores any cloud-drive cookie or password.**
 **控制面不保存任何网盘 Cookie 或密码**，登录态只存在于 Driver 所在设备。
+
+## 界面 | Web UI
+
+v0.4 ships a dark, single-page web UI in the spirit of MoviePilot: a fixed
+sidebar （仪表盘 / 我的订阅 / 发现 / 设置）, dashboard stat cards, a **poster-wall**
+subscription grid (TMDB poster, season/episode progress bar, status badge,
+pause/resume/delete), a TMDB discover page with a detail dialog for
+per-season subscribing, and a card-style settings page. On narrow screens the
+sidebar collapses into a top bar. The UI is served by the same single Worker —
+no separate frontend build.
+
+v0.4 的网页是深色单页界面：左侧固定导航（仪表盘 / 我的订阅 / 发现 / 设置）、
+仪表盘统计卡、**海报墙**订阅卡片（TMDB 海报、季集进度条、状态徽章、暂停/恢复/删除）、
+发现页 TMDB 海报网格 + 详情弹窗按季订阅、卡片式设置页；手机上侧边栏收起为顶部
+横向导航。界面仍由同一个 Worker 内嵌提供，无需单独打包前端。
+
+> **Acknowledgement / 致谢**: the web UI's layout and interaction ideas are
+> inspired by [MoviePilot](https://github.com/jxxghp/MoviePilot). PanPilot's
+> UI is an **independent implementation** written from scratch for this
+> project — no MoviePilot code or assets are used.
+> 本项目界面的布局与交互灵感来自 MoviePilot，但代码为**独立实现**，未使用
+> MoviePilot 的任何代码或素材。
 
 ## 架构 | Architecture
 
@@ -105,9 +128,12 @@ back to an in-memory store. `GET /api/health` honestly reports which is active
 
 What the script does / 脚本做的事：
 
-1. Creates (or reuses) the D1 database `panpilot` and applies
-   `migrations/0001_init.sql` statement-by-statement via the D1 query API,
-   then verifies all six tables exist. 创建 D1 并逐条执行迁移、核对六表。
+1. Creates (or reuses) the D1 database `panpilot` and applies every
+   `migrations/*.sql` file statement-by-statement via the D1 query API,
+   then verifies all six tables exist. For schema-only updates on an existing
+   deployment, run `python3 scripts/deploy.py --step migrate` (idempotent;
+   does not touch secrets). 创建 D1 并逐条执行全部迁移、核对六表；已有部署只
+   升级表结构时用 `--step migrate`（幂等，不动任何 Secret）。
 2. Bundles `src/index.ts` with esbuild and uploads it as a Worker module with
    bindings: D1 `DB`, plain-text `CHECK_INTERVAL_HOURS=6`. 打包并上传 Worker。
 3. Sets the secrets `APP_USERNAME` / `APP_PASSWORD` (initial values chosen by
