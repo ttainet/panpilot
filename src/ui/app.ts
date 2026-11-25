@@ -3,9 +3,12 @@ import { APP_SCRIPT } from "./client";
 import {
   ICON_ARROW_RIGHT,
   ICON_BRAND,
+  ICON_CHEVRON,
+  ICON_CHEVRON_LEFT,
   ICON_CLOSE,
   ICON_COPY,
   ICON_DASH,
+  ICON_EXPLORE,
   ICON_FILM,
   ICON_FIND,
   ICON_GEAR,
@@ -49,6 +52,7 @@ export function appHtml(initialView: string): string {
     <nav class="menu" aria-label="主导航">
       <button type="button" class="menu-item" data-nav="dashboard">${ICON_DASH}<span>仪表盘</span></button>
       <button type="button" class="menu-item" data-nav="subscriptions">${ICON_SUBS}<span>我的订阅</span><span class="nav-pill num" id="nav-sub-count">0</span></button>
+      <button type="button" class="menu-item" data-nav="explore">${ICON_EXPLORE}<span>探索</span></button>
       <button type="button" class="menu-item" data-nav="discover">${ICON_FIND}<span>发现</span></button>
       <button type="button" class="menu-item" data-nav="logs">${ICON_LOG}<span>日志</span></button>
       <button type="button" class="menu-item" data-nav="settings">${ICON_GEAR}<span>设置</span><span class="nav-dot" id="nav-settings-dot" hidden title="有待处理配置"></span></button>
@@ -170,6 +174,88 @@ export function appHtml(initialView: string): string {
           <div class="empty-icon">${ICON_FILM}</div>
           <p id="sub-empty-text">暂无订阅</p>
           <button type="button" class="btn btn-primary btn-sm" id="sub-empty-cta" hidden>去「发现」添加订阅</button>
+        </div>
+      </section>
+
+      <!-- ==================== 探索 ==================== -->
+      <section class="view" id="view-explore">
+        <div class="exp-topbar">
+          <div class="seg" role="tablist" aria-label="探索来源">
+            <button type="button" class="seg-btn active" data-exptab="recommend" role="tab">推荐榜单</button>
+            <button type="button" class="seg-btn" data-exptab="tmdb" role="tab">TMDB 探索</button>
+            <button type="button" class="seg-btn" data-exptab="douban" role="tab">豆瓣榜单</button>
+          </div>
+          <button type="button" class="btn btn-sm" id="exp-go-search">${ICON_SEARCH}<span>精准搜片 / 手动录入</span></button>
+        </div>
+
+        <div class="exp-panel active" id="exp-panel-recommend">
+          <div id="exp-shelves">
+            <div class="skeleton" style="height:240px;margin-bottom:1.4rem;border-radius:16px"></div>
+            <div class="skeleton" style="height:240px;border-radius:16px"></div>
+          </div>
+        </div>
+
+        <div class="exp-panel" id="exp-panel-tmdb">
+          <div class="exp-filters">
+            <div class="seg" role="tablist" aria-label="TMDB 媒体类型">
+              <button type="button" class="seg-btn active" data-tmdb-type="tv">电视剧</button>
+              <button type="button" class="seg-btn" data-tmdb-type="movie">电影</button>
+            </div>
+            <select id="exp-tmdb-sort" aria-label="排序方式">
+              <option value="popularity.desc">最热门</option>
+              <option value="vote_average.desc">高分好评</option>
+              <option value="first_air_date.desc">最新播出</option>
+            </select>
+            <select id="exp-tmdb-genre" aria-label="题材分类">
+              <option value="">全部题材</option>
+              <option value="18">剧情</option>
+              <option value="35">喜剧</option>
+              <option value="10759">动作冒险</option>
+              <option value="9648">悬疑</option>
+              <option value="10765">科幻奇幻</option>
+              <option value="16">动画</option>
+              <option value="80">犯罪</option>
+              <option value="99">纪录片</option>
+            </select>
+            <select id="exp-tmdb-lang" aria-label="语言地区">
+              <option value="">全部地区</option>
+              <option value="zh">华语</option>
+              <option value="en">欧美</option>
+              <option value="ja">日本</option>
+              <option value="ko">韩国</option>
+            </select>
+            <select id="exp-tmdb-year" aria-label="年份">
+              <option value="">全部年份</option>
+              <option value="2026">2026</option>
+              <option value="2025">2025</option>
+              <option value="2024">2024</option>
+              <option value="2023">2023</option>
+              <option value="2022">2022</option>
+            </select>
+          </div>
+          <div id="exp-tmdb-guide"></div>
+          <div class="exp-grid" id="exp-tmdb-grid"></div>
+          <div class="exp-more-wrap"><button type="button" class="btn" id="exp-tmdb-more" hidden>加载更多</button></div>
+        </div>
+
+        <div class="exp-panel" id="exp-panel-douban">
+          <div class="exp-pills" id="exp-douban-pills" role="tablist" aria-label="豆瓣榜单分类">
+            <button type="button" class="pill-btn active" data-dbcol="tv_hot">热门剧集</button>
+            <button type="button" class="pill-btn" data-dbcol="movie_showing">正在热映</button>
+            <button type="button" class="pill-btn" data-dbcol="movie_hot_gaia">热门电影</button>
+            <button type="button" class="pill-btn" data-dbcol="tv_domestic">国产剧</button>
+            <button type="button" class="pill-btn" data-dbcol="tv_american">欧美剧</button>
+            <button type="button" class="pill-btn" data-dbcol="tv_japanese">日剧</button>
+            <button type="button" class="pill-btn" data-dbcol="tv_korean">韩剧</button>
+            <button type="button" class="pill-btn" data-dbcol="tv_animation">热门动画</button>
+            <button type="button" class="pill-btn" data-dbcol="tv_variety_show">热门综艺</button>
+            <button type="button" class="pill-btn" data-dbcol="tv_chinese_best_weekly">华语口碑剧</button>
+            <button type="button" class="pill-btn" data-dbcol="tv_global_best_weekly">全球口碑剧</button>
+            <button type="button" class="pill-btn" data-dbcol="movie_weekly_best">一周口碑电影</button>
+            <button type="button" class="pill-btn" data-dbcol="movie_top250">豆瓣 Top250</button>
+          </div>
+          <div class="exp-grid" id="exp-douban-grid"></div>
+          <div class="exp-more-wrap"><button type="button" class="btn" id="exp-douban-more" hidden>加载更多</button></div>
         </div>
       </section>
 
@@ -558,7 +644,8 @@ export function appHtml(initialView: string): string {
               <div class="once-vault-title">${ICON_KEY}<span>新 Key 只显示这一次，请立即复制保存到 Driver 配置：</span></div>
               <form class="input-group" id="dk-once-form">
                 <input id="dk-once-value" readonly autocomplete="off">
-                <button type="button" class="btn btn-primary" id="dk-copy">复制 Key</button>
+                <button type="button" class="btn btn-primary" id="dk-copy-prompt">复制 AI 启动指令（含此 Key）</button>
+                <button type="button" class="btn" id="dk-copy">仅复制 Key</button>
                 <button type="button" class="btn btn-ghost" id="dk-once-close">我已保存，关闭</button>
               </form>
             </div>
@@ -574,6 +661,50 @@ export function appHtml(initialView: string): string {
             </form>
             <p id="dk-msg" class="muted" style="margin-top:.65rem"></p>
             <p class="muted" style="margin-top:.4rem">提示：部署时设置的 <code>DRIVER_TOKEN</code> 为系统引导 Key，始终有效且不在此列表中展示。</p>
+          </div>
+
+          <div class="card" id="card-agent-guide">
+            <div class="card-head">
+              <h2>AI Driver 启动指令 & 操作手册（agent-guide）</h2>
+              <span class="status-pill-box">网页端专属 · 支持带 Key 复制</span>
+            </div>
+            <p class="section-desc">新建 Key 后会自动临时带入下方启动指令；也可以手动粘贴已有 Key，一键复制完整指令发给 Claude / AI Driver 即可立即开始拉取订阅与转存。明文 Key <strong>仅在当前页面内存拼接，绝不保存</strong>。</p>
+
+            <div class="form-grid-2">
+              <div class="field">
+                <label class="field-label" for="ag-key-input">临时注入 API Key（仅本地内存拼接）</label>
+                <input id="ag-key-input" type="password" placeholder="新建 Key 自动带入，或粘贴已有 ppk_... Key" autocomplete="off">
+                <span class="field-hint" id="ag-key-hint">未填写时提示词中使用 &lt;YOUR_DRIVER_API_KEY&gt; 占位符</span>
+              </div>
+              <div class="field">
+                <label class="field-label" for="ag-driver-id">指定 driver_id</label>
+                <input id="ag-driver-id" value="ai-driver" placeholder="如 claude-main / home-nas" autocomplete="off">
+                <span class="field-hint">AI 认领任务、续约和上报日志时使用的唯一身份标识</span>
+              </div>
+            </div>
+
+            <div style="margin-top:.85rem">
+              <label class="switch-row" for="ag-include-key">
+                <div class="switch-text">
+                  <div class="switch-title">复制与预览时附带明文 API Key</div>
+                  <div class="switch-desc">仅发送给你信任的 AI 对话使用；切勿把含 Key 的指令发到公开渠道或截图</div>
+                </div>
+                <span class="switch"><input type="checkbox" id="ag-include-key" checked><span class="switch-track"></span></span>
+              </label>
+            </div>
+
+            <pre class="preview-terminal" id="ag-prompt-preview" style="white-space:pre-wrap;word-break:break-word;margin-top:.9rem">加载中…</pre>
+
+            <div class="form-actions">
+              <button type="button" class="btn btn-primary" id="ag-copy-short">${ICON_COPY}<span>复制精简启动指令</span></button>
+              <button type="button" class="btn" id="ag-copy-full">${ICON_COPY}<span>复制完整手册 + 启动指令</span></button>
+              <button type="button" class="btn" id="ag-copy-guide">${ICON_COPY}<span>仅复制手册原文</span></button>
+              <button type="button" class="btn btn-ghost" id="ag-toggle-full">展开完整手册全文</button>
+            </div>
+
+            <div id="ag-full-wrap" hidden style="margin-top:.95rem">
+              <pre class="preview-terminal" id="ag-full-text" style="max-height:460px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin-top:0">加载中…</pre>
+            </div>
           </div>
 
           <div class="card">
@@ -704,6 +835,7 @@ export function appHtml(initialView: string): string {
 <nav class="mobile-tabs" aria-label="移动端导航">
   <button type="button" class="mobile-tab" data-nav="dashboard">${ICON_DASH}<span>仪表盘</span></button>
   <button type="button" class="mobile-tab" data-nav="subscriptions">${ICON_SUBS}<span>订阅</span></button>
+  <button type="button" class="mobile-tab" data-nav="explore">${ICON_EXPLORE}<span>探索</span></button>
   <button type="button" class="mobile-tab" data-nav="discover">${ICON_FIND}<span>发现</span></button>
   <button type="button" class="mobile-tab" data-nav="logs">${ICON_LOG}<span>日志</span></button>
   <button type="button" class="mobile-tab" data-nav="settings">${ICON_GEAR}<span>设置</span><span class="nav-dot" id="nav-settings-dot-m" hidden></span></button>

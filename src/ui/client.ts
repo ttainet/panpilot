@@ -2,6 +2,7 @@ import {
   ICON_ALERT,
   ICON_CHECK,
   ICON_CHEVRON,
+  ICON_CHEVRON_LEFT,
   ICON_INFO,
   ICON_MOON,
   ICON_PAUSE,
@@ -24,12 +25,13 @@ const ICON_JSON = JSON.stringify({
   check: ICON_CHECK,
   alert: ICON_ALERT,
   chevron: ICON_CHEVRON,
+  chevronLeft: ICON_CHEVRON_LEFT,
 });
 
 export const APP_SCRIPT = `var ICONS = ${ICON_JSON};
 ` + String.raw`
-var VIEWS = ['dashboard', 'subscriptions', 'discover', 'logs', 'settings'];
-var VIEW_TITLES = { dashboard: '仪表盘', subscriptions: '我的订阅', discover: '发现', logs: '日志', settings: '设置' };
+var VIEWS = ['dashboard', 'subscriptions', 'explore', 'discover', 'logs', 'settings'];
+var VIEW_TITLES = { dashboard: '仪表盘', subscriptions: '我的订阅', explore: '探索', discover: '发现', logs: '日志', settings: '设置' };
 var FINISHED_STATUSES = ['completed', 'ended'];
 function isFinishedSub(s) { return FINISHED_STATUSES.indexOf(s.status) >= 0; }
 var STATUS_LABEL = {
@@ -310,6 +312,7 @@ function switchView(name) {
   if (location.hash !== wantHash) history.replaceState(null, '', wantHash);
   if (name === 'settings') switchSettingsTab(currentSettingsTab);
   if (name === 'logs') loadLogs(true);
+  if (name === 'explore') ensureExploreLoaded();
 }
 var navItems = document.querySelectorAll('[data-nav]');
 for (var n = 0; n < navItems.length; n++) {
@@ -668,6 +671,7 @@ async function loadSubs() {
   renderDashboard(sd.stats);
   renderDashAlerts();
   renderLogSubFilter();
+  refreshExploreSubBadges();
 }
 
 async function openSubDetail(id) {
@@ -957,7 +961,7 @@ document.getElementById('modal-backdrop').addEventListener('click', function (e)
   if (e.target === this) closeModal();
 });
 
-async function openDetail(item) {
+async function openDetail(item, overrideMediaType) {
   modalDetails = null;
   var box = document.getElementById('modal-content');
   box.innerHTML = '<div class="skeleton" style="height:170px;margin-bottom:1rem"></div><div class="skeleton" style="height:80px"></div>';
@@ -971,6 +975,7 @@ async function openDetail(item) {
     return;
   }
   var d = data.details;
+  if (overrideMediaType) d.media_type = overrideMediaType;
   modalDetails = d;
   var poster = d.poster_path
     ? '<img src="' + posterUrl(d.poster_path, 'w342') + '" alt="">'
@@ -986,7 +991,7 @@ async function openDetail(item) {
   var qualityField = '<div class="field"><label class="field-label" for="m-quality">画质覆盖</label>'
     + '<select id="m-quality"><option value="">跟随全局</option><option value="2160p">优先 4K</option>'
     + '<option value="1080p">优先 1080p</option><option value="720p">优先 720p</option></select></div>';
-  var controls = d.media_type === 'tv'
+  var controls = (d.media_type === 'tv' || d.media_type === 'variety') && seasonOptions
     ? '<div class="form-grid-3" style="margin-top:.85rem"><div class="field"><label class="field-label" for="m-season">订阅季</label>'
       + '<select id="m-season">' + seasonOptions + '</select></div>' + modeField + qualityField + '</div>'
     : '<div class="form-grid-2" style="margin-top:.85rem">' + modeField + qualityField + '</div>';
@@ -994,7 +999,7 @@ async function openDetail(item) {
   box.innerHTML = '<div class="modal-hero">' + poster
     + '<div style="flex:1;min-width:0"><div class="modal-title">' + esc(d.title)
     + (d.year ? ' <span class="sub-year num">' + d.year + '</span>' : '') + '</div>'
-    + '<div class="tag-row"><span class="tag">' + (d.media_type === 'movie' ? '电影' : '电视剧') + '</span>'
+    + '<div class="tag-row"><span class="tag">' + mediaLabel(d.media_type) + '</span>'
     + (d.region ? '<span class="tag">' + esc(d.region) + '</span>' : '')
     + (d.rating ? '<span class="tag tag-rate">★ ' + Number(d.rating).toFixed(1) + '</span>' : '')
     + (d.genres && d.genres.length ? '<span class="tag">' + esc(d.genres.join(' / ')) + '</span>' : '') + '</div>'
@@ -1021,7 +1026,7 @@ async function subscribeFromModal() {
       poster_path: d.poster_path || undefined, overview: d.overview || undefined,
       rating: typeof d.rating === 'number' ? d.rating : undefined
     };
-    if (d.media_type === 'tv') {
+    if (d.media_type === 'tv' || d.media_type === 'variety') {
       var sel = document.getElementById('m-season');
       if (sel) {
         payload.season = Number(sel.value);
@@ -1413,32 +1418,157 @@ document.getElementById('quality-reset').addEventListener('click', async functio
   loadSettings();
 });
 
-/* ---------- Settings: Driver API Keys ---------- */
-function showOnceKey(token) {
+/* ---------- Settings: Driver API Keys & Agent Guide ---------- */
+var agentGuideCache = null;
+function copyPlainText(text, okMsg) {
+  var done = function () { toast(okMsg, 'success'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, function () {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      done();
+    });
+  } else {
+    var ta2 = document.createElement('textarea');
+    ta2.value = text;
+    ta2.style.position = 'fixed';
+    ta2.style.opacity = '0';
+    document.body.appendChild(ta2);
+    ta2.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta2);
+    done();
+  }
+}
+async function ensureAgentGuide() {
+  if (agentGuideCache !== null) return agentGuideCache;
+  var r = await api('/api/agent-guide');
+  var data = await r.json().catch(function () { return null; });
+  if (!r.ok || !data || !data.guide) throw new Error('拉取 Agent Guide 失败');
+  agentGuideCache = data.guide;
+  return agentGuideCache;
+}
+function buildAiPrompt(fullGuideText) {
+  var base = location.origin;
+  var includeKey = document.getElementById('ag-include-key').checked;
+  var rawKey = (document.getElementById('ag-key-input').value || '').trim();
+  var keyDisplay = (includeKey && rawKey) ? rawKey : '<YOUR_DRIVER_API_KEY>';
+  var driverId = (document.getElementById('ag-driver-id').value || '').trim() || 'ai-driver';
+  var lines = [
+    '你是 PanPilot 的 AI Driver，请立即开始执行一轮影视订阅检查、搜索与夸克转存入库。',
+    '',
+    '【连接凭据】',
+    '- 控制面 BASE：' + base,
+    '- 鉴权请求头：Authorization: Bearer ' + keyDisplay,
+    '- driver_id：' + driverId,
+    '- 重要提醒：所有请求必须携带常见浏览器 User-Agent（避免被 Cloudflare 边缘 1010 拦截）；严禁把 API Key、夸克 Cookie 或 TMDB Key 写入任何日志、progress note 或汇报文本。',
+    '',
+    '【开始步骤】',
+    '1. 先拉取并通读操作手册：GET ' + base + '/api/driver/agent-guide',
+    '2. 拉取执行配置：GET ' + base + '/api/driver/config（一次取齐夸克 Cookie、TMDB Key、频道清单、目录与全局画质设置）',
+    '3. 拉取到期订阅：GET ' + base + '/api/driver/pending?limit=20，按手册十步流程逐条 claim（409 跳过）→ 盘点夸克实际目录 → 搜索 → 筛选 → 转存 → 重命名 → 复核 → 回写 progress 与 logs。'
+  ];
+  if (fullGuideText) {
+    lines.push('', '---', '', fullGuideText.split('https://your-panpilot.example.com').join(base));
+  }
+  return lines.join('\n');
+}
+function renderAiPromptPreview() {
+  var pre = document.getElementById('ag-prompt-preview');
+  var hint = document.getElementById('ag-key-hint');
+  var rawKey = (document.getElementById('ag-key-input').value || '').trim();
+  if (hint) {
+    hint.textContent = rawKey
+      ? ('当前已填入 Key（长度 ' + rawKey.length + ' 字符，仅存于当前页面内存）')
+      : '未填写时提示词中使用 <YOUR_DRIVER_API_KEY> 占位符';
+  }
+  if (pre) pre.textContent = buildAiPrompt(null);
+}
+function showOnceKey(token, name) {
   var box = document.getElementById('dk-once');
   document.getElementById('dk-once-value').value = token;
   box.hidden = false;
+  var agKey = document.getElementById('ag-key-input');
+  var agDid = document.getElementById('ag-driver-id');
+  if (agKey) agKey.value = token;
+  if (agDid && name) agDid.value = name;
+  renderAiPromptPreview();
   box.scrollIntoView({ block: 'nearest' });
 }
 document.getElementById('dk-copy').addEventListener('click', function () {
   var input = document.getElementById('dk-once-value');
-  input.select();
-  var done = function () {
-    document.getElementById('dk-msg').textContent = '已复制到剪贴板。';
-    toast('API Key 已复制到剪贴板', 'success');
-  };
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(input.value).then(done, function () {
-      document.execCommand('copy'); done();
-    });
-  } else {
-    document.execCommand('copy'); done();
-  }
+  document.getElementById('dk-msg').textContent = '已复制到剪贴板。';
+  copyPlainText(input.value, 'API Key 已复制到剪贴板');
+});
+document.getElementById('dk-copy-prompt').addEventListener('click', function () {
+  var inc = document.getElementById('ag-include-key');
+  if (inc && !inc.checked) { inc.checked = true; renderAiPromptPreview(); }
+  copyPlainText(buildAiPrompt(null), '已复制含 Key 的 AI 启动指令');
 });
 document.getElementById('dk-once-close').addEventListener('click', function () {
   document.getElementById('dk-once').hidden = true;
   document.getElementById('dk-once-value').value = '';
+  document.getElementById('ag-key-input').value = '';
+  renderAiPromptPreview();
 });
+document.getElementById('ag-key-input').addEventListener('input', renderAiPromptPreview);
+document.getElementById('ag-driver-id').addEventListener('input', renderAiPromptPreview);
+document.getElementById('ag-include-key').addEventListener('change', renderAiPromptPreview);
+document.getElementById('ag-copy-short').addEventListener('click', function () {
+  copyPlainText(buildAiPrompt(null), '已复制 AI 启动指令');
+});
+document.getElementById('ag-copy-full').addEventListener('click', async function () {
+  var btn = this;
+  setBtnLoading(btn, true);
+  try {
+    var guide = await ensureAgentGuide();
+    copyPlainText(buildAiPrompt(guide), '已复制完整操作手册 + 启动指令');
+  } catch (e) {
+    toast(e && e.message ? e.message : '拉取手册失败', 'error');
+  } finally {
+    setBtnLoading(btn, false);
+  }
+});
+document.getElementById('ag-copy-guide').addEventListener('click', async function () {
+  var btn = this;
+  setBtnLoading(btn, true);
+  try {
+    var guide = await ensureAgentGuide();
+    copyPlainText(guide.split('https://your-panpilot.example.com').join(location.origin), '已复制操作手册原文');
+  } catch (e) {
+    toast(e && e.message ? e.message : '拉取手册失败', 'error');
+  } finally {
+    setBtnLoading(btn, false);
+  }
+});
+document.getElementById('ag-toggle-full').addEventListener('click', async function () {
+  var btn = this;
+  var wrap = document.getElementById('ag-full-wrap');
+  var pre = document.getElementById('ag-full-text');
+  if (!wrap.hidden) {
+    wrap.hidden = true;
+    btn.textContent = '展开完整手册全文';
+    return;
+  }
+  setBtnLoading(btn, true);
+  try {
+    var guide = await ensureAgentGuide();
+    pre.textContent = guide.split('https://your-panpilot.example.com').join(location.origin);
+    wrap.hidden = false;
+    btn.textContent = '收起完整手册';
+  } catch (e) {
+    toast(e && e.message ? e.message : '拉取手册失败', 'error');
+  } finally {
+    setBtnLoading(btn, false);
+  }
+});
+renderAiPromptPreview();
 async function loadDriverKeys() {
   var st = document.getElementById('driver-keys-status');
   var box = document.getElementById('driver-keys-list');
@@ -1491,7 +1621,7 @@ document.getElementById('driver-keys-list').addEventListener('click', async func
       }
       msg.textContent = '已重置：旧 Key 已吊销，新 Key 请在上方复制（仅展示一次）。';
       toast('Key 已重置，请立即复制保存', 'success');
-      showOnceKey(rd.key);
+      showOnceKey(rd.key, rd.driver_key && rd.driver_key.name);
       loadDriverKeys();
     } finally {
       setBtnLoading(resetBtn, false);
@@ -1542,7 +1672,7 @@ document.getElementById('dk-form').addEventListener('submit', async function (e)
     document.getElementById('dk-name').value = '';
     msg.textContent = '已创建：请把上方 Key 配置到 Driver 里（仅显示一次）。';
     toast('已生成新的 Driver API Key', 'success');
-    showOnceKey(data.key);
+    showOnceKey(data.key, data.driver_key && data.driver_key.name);
     loadDriverKeys();
   } finally {
     setBtnLoading(btn, false);
@@ -1851,6 +1981,395 @@ document.getElementById('wc-clear-secrets').addEventListener('click', async func
   toast('已清除企业微信密钥', 'info');
   loadSettings();
 });
+
+/* ---------- Explore (MoviePilot-style shelves & rankings) ---------- */
+var expTab = 'recommend';
+var expInited = false;
+var expTmdbType = 'tv';
+var expTmdbPage = 1;
+var expTmdbTotalPages = 1;
+var expTmdbLoading = false;
+var expDoubanCol = 'tv_hot';
+var expDoubanStart = 0;
+var expDoubanHasMore = false;
+var expDoubanLoading = false;
+var expCache = {};
+var expItemMap = {};
+
+var EXP_SHELVES = [
+  { id: 'tmdb-trending', title: 'TMDB 本周流行', source: 'tmdb', url: '/api/explore/tmdb?kind=trending&type=all&page=1', jump: { tab: 'tmdb', type: 'tv', sort: 'popularity.desc' } },
+  { id: 'db-tv-hot', title: '豆瓣热门剧集', source: 'douban', url: '/api/explore/douban?collection=tv_hot&start=0&count=18', jump: { tab: 'douban', col: 'tv_hot' } },
+  { id: 'db-movie-showing', title: '豆瓣正在热映', source: 'douban', url: '/api/explore/douban?collection=movie_showing&start=0&count=18', jump: { tab: 'douban', col: 'movie_showing' } },
+  { id: 'tmdb-tv-popular', title: 'TMDB 热门剧集', source: 'tmdb', url: '/api/explore/tmdb?kind=popular&type=tv&page=1', jump: { tab: 'tmdb', type: 'tv', sort: 'popularity.desc' } },
+  { id: 'tmdb-movie-popular', title: 'TMDB 热门电影', source: 'tmdb', url: '/api/explore/tmdb?kind=popular&type=movie&page=1', jump: { tab: 'tmdb', type: 'movie', sort: 'popularity.desc' } },
+  { id: 'db-tv-domestic', title: '豆瓣热门国产剧', source: 'douban', url: '/api/explore/douban?collection=tv_domestic&start=0&count=18', jump: { tab: 'douban', col: 'tv_domestic' } },
+  { id: 'db-tv-variety', title: '豆瓣热门综艺', source: 'douban', url: '/api/explore/douban?collection=tv_variety_show&start=0&count=18', jump: { tab: 'douban', col: 'tv_variety_show' } },
+  { id: 'db-tv-anime', title: '豆瓣热门动画', source: 'douban', url: '/api/explore/douban?collection=tv_animation&start=0&count=18', jump: { tab: 'douban', col: 'tv_animation' } }
+];
+
+function isItemSubscribed(item) {
+  var t = (item.title || '').trim().toLowerCase();
+  for (var i = 0; i < subsCache.length; i++) {
+    var s = subsCache[i];
+    if (item.tmdb_id && s.tmdb_id === item.tmdb_id && s.media_type === item.media_type) return true;
+    if (t && (s.title || '').trim().toLowerCase() === t) return true;
+  }
+  return false;
+}
+function expCardHtml(item) {
+  expItemMap[item.id] = item;
+  var subbed = isItemSubscribed(item);
+  var poster = item.poster_url
+    ? '<img src="' + esc(item.poster_url) + '" alt="" loading="lazy">'
+    : '<div class="poster-ph">' + esc((item.title || '?').slice(0, 1)) + '</div>';
+  var typeLbl = item.media_type === 'movie' ? '电影' : (item.media_type === 'variety' ? '综艺' : '剧集');
+  var rateBadge = item.rating ? '<span class="tmdb-rate-badge num">★ ' + Number(item.rating).toFixed(1) + '</span>' : '';
+  var epBadge = item.episodes_info ? '<span class="exp-ep-badge">' + esc(item.episodes_info) + '</span>' : '';
+  var subBadge = subbed ? '<span class="exp-sub-badge">已订阅</span>' : '';
+  var metaLine = [item.year || '', item.region || ''].filter(Boolean).join(' · ') || (item.subtitle || '');
+  return '<article class="exp-card" data-exp-id="' + esc(item.id) + '" data-exp-sub-key="' + esc(item.id) + '">'
+    + '<div class="exp-poster">' + poster
+    + '<span class="tmdb-type-badge">' + typeLbl + '</span>'
+    + subBadge + epBadge + rateBadge + '</div>'
+    + '<div class="exp-info"><div class="exp-title" title="' + esc(item.title) + '">' + esc(item.title) + '</div>'
+    + '<div class="exp-meta num">' + esc(metaLine || '点击查看详情') + '</div></div></article>';
+}
+function refreshExploreSubBadges() {
+  var cards = document.querySelectorAll('.exp-card[data-exp-id]');
+  for (var i = 0; i < cards.length; i++) {
+    var item = expItemMap[cards[i].getAttribute('data-exp-id')];
+    if (!item) continue;
+    var box = cards[i].querySelector('.exp-poster');
+    if (!box) continue;
+    var cur = box.querySelector('.exp-sub-badge');
+    var has = isItemSubscribed(item);
+    if (has && !cur) box.insertAdjacentHTML('beforeend', '<span class="exp-sub-badge">已订阅</span>');
+    else if (!has && cur) cur.parentNode.removeChild(cur);
+  }
+}
+function switchExploreTab(tab) {
+  expTab = tab === 'tmdb' || tab === 'douban' ? tab : 'recommend';
+  var btns = document.querySelectorAll('[data-exptab]');
+  for (var i = 0; i < btns.length; i++) btns[i].classList.toggle('active', btns[i].getAttribute('data-exptab') === expTab);
+  ['recommend', 'tmdb', 'douban'].forEach(function (k) {
+    document.getElementById('exp-panel-' + k).classList.toggle('active', k === expTab);
+  });
+  if (expTab === 'tmdb' && !document.getElementById('exp-tmdb-grid').children.length) loadTmdbExplore(true);
+  if (expTab === 'douban' && !document.getElementById('exp-douban-grid').children.length) loadDoubanExplore(true);
+}
+var expTabBtns = document.querySelectorAll('[data-exptab]');
+for (var eti = 0; eti < expTabBtns.length; eti++) {
+  expTabBtns[eti].addEventListener('click', function () { switchExploreTab(this.getAttribute('data-exptab')); });
+}
+document.getElementById('exp-go-search').addEventListener('click', goDiscover);
+
+function ensureExploreLoaded() {
+  if (expInited) return;
+  expInited = true;
+  loadExploreRecommend();
+}
+async function loadExploreRecommend() {
+  var box = document.getElementById('exp-shelves');
+  box.innerHTML = EXP_SHELVES.map(function (sh) {
+    return '<div class="exp-shelf" id="shelf-' + sh.id + '">'
+      + '<div class="exp-shelf-head"><div class="exp-shelf-title-wrap">'
+      + '<h3 class="exp-shelf-title">' + esc(sh.title) + '</h3>'
+      + '<span class="exp-src-tag ' + (sh.source === 'tmdb' ? 'exp-src-tmdb' : 'exp-src-douban') + '">' + (sh.source === 'tmdb' ? 'TMDB' : '豆瓣') + '</span>'
+      + '</div><button type="button" class="btn btn-ghost btn-sm" data-shelf-jump="' + sh.id + '">查看全部 ' + ICONS.chevron + '</button></div>'
+      + '<div class="exp-track-wrap" id="track-wrap-' + sh.id + '">'
+      + '<div class="exp-track" id="track-' + sh.id + '">'
+      + '<div class="skeleton" style="flex:0 0 158px;aspect-ratio:2/3;border-radius:12px"></div>'.repeat(6)
+      + '</div></div></div>';
+  }).join('');
+
+  var tmdbTipShown = false;
+  await Promise.all(EXP_SHELVES.map(async function (sh) {
+    var track = document.getElementById('track-' + sh.id);
+    var wrap = document.getElementById('track-wrap-' + sh.id);
+    if (!track) return;
+    try {
+      var data = expCache[sh.url];
+      if (!data) {
+        var r = await api(sh.url);
+        data = await r.json().catch(function () { return null; });
+        if (!r.ok) {
+          if (data && data.error && data.error.code === 'tmdb_not_configured') {
+            if (!tmdbTipShown) {
+              tmdbTipShown = true;
+              track.innerHTML = '<div class="guide-card" style="width:100%;margin:0"><h3>TMDB 榜单暂未开启</h3><p class="muted" style="margin:0 0 .6rem">在「设置 → 媒体信息」保存 TMDB API Key 后即可查看 TMDB 流行与高分榜单；下方豆瓣榜单仍可直接浏览订阅。</p><button type="button" class="btn btn-primary btn-sm" id="exp-go-tmdb-cfg">去配置 TMDB Key</button></div>';
+              var cfgBtn = document.getElementById('exp-go-tmdb-cfg');
+              if (cfgBtn) cfgBtn.addEventListener('click', function () { switchView('settings'); switchSettingsTab('tmdb'); });
+            } else {
+              var shelfEl = document.getElementById('shelf-' + sh.id);
+              if (shelfEl) shelfEl.style.display = 'none';
+            }
+            return;
+          }
+          track.innerHTML = '<p class="muted">暂时无法加载该榜单。</p>';
+          return;
+        }
+        expCache[sh.url] = data;
+      }
+      var items = data.items || [];
+      if (!items.length) { track.innerHTML = '<p class="muted">暂无数据。</p>'; return; }
+      track.innerHTML = items.map(expCardHtml).join('');
+      if (wrap && !wrap.querySelector('.exp-scroll-btn')) {
+        wrap.insertAdjacentHTML('beforeend',
+          '<button type="button" class="exp-scroll-btn exp-scroll-prev" data-scroll-dir="-1" aria-label="向左滚动">' + ICONS.chevronLeft + '</button>'
+          + '<button type="button" class="exp-scroll-btn exp-scroll-next" data-scroll-dir="1" aria-label="向右滚动">' + ICONS.chevron + '</button>');
+      }
+    } catch (e) {
+      track.innerHTML = '<p class="muted">加载失败。</p>';
+    }
+  }));
+}
+
+document.getElementById('exp-shelves').addEventListener('click', function (e) {
+  var jumpBtn = e.target.closest('button[data-shelf-jump]');
+  if (jumpBtn) {
+    var sid = jumpBtn.getAttribute('data-shelf-jump');
+    for (var i = 0; i < EXP_SHELVES.length; i++) {
+      if (EXP_SHELVES[i].id === sid) {
+        var j = EXP_SHELVES[i].jump;
+        if (j.tab === 'tmdb') {
+          expTmdbType = j.type || 'tv';
+          setTmdbTypeButtons(expTmdbType);
+          var sortEl = document.getElementById('exp-tmdb-sort');
+          if (sortEl) { sortEl.value = j.sort || 'popularity.desc'; syncCustomSelect(sortEl); }
+          switchExploreTab('tmdb');
+          loadTmdbExplore(true);
+        } else {
+          selectDoubanCollection(j.col || 'tv_hot');
+          switchExploreTab('douban');
+        }
+        return;
+      }
+    }
+    return;
+  }
+  var scrollBtn = e.target.closest('button[data-scroll-dir]');
+  if (scrollBtn) {
+    var wrap = scrollBtn.closest('.exp-track-wrap');
+    var track = wrap && wrap.querySelector('.exp-track');
+    if (track) track.scrollBy({ left: Number(scrollBtn.getAttribute('data-scroll-dir')) * 560, behavior: 'smooth' });
+    return;
+  }
+  var card = e.target.closest('.exp-card[data-exp-id]');
+  if (card) openExploreCard(card);
+});
+
+function setTmdbTypeButtons(t) {
+  var btns = document.querySelectorAll('[data-tmdb-type]');
+  for (var i = 0; i < btns.length; i++) btns[i].classList.toggle('active', btns[i].getAttribute('data-tmdb-type') === t);
+}
+async function loadTmdbExplore(reset) {
+  if (expTmdbLoading) return;
+  expTmdbLoading = true;
+  var grid = document.getElementById('exp-tmdb-grid');
+  var guide = document.getElementById('exp-tmdb-guide');
+  var moreBtn = document.getElementById('exp-tmdb-more');
+  if (reset) {
+    expTmdbPage = 1;
+    guide.innerHTML = '';
+    grid.innerHTML = '<div class="skeleton" style="aspect-ratio:2/3;border-radius:12px"></div>'.repeat(12);
+    moreBtn.hidden = true;
+  } else {
+    setBtnLoading(moreBtn, true);
+  }
+  try {
+    var sort = document.getElementById('exp-tmdb-sort').value;
+    var genre = document.getElementById('exp-tmdb-genre').value;
+    var lang = document.getElementById('exp-tmdb-lang').value;
+    var year = document.getElementById('exp-tmdb-year').value;
+    var qs = '?kind=discover&type=' + encodeURIComponent(expTmdbType)
+      + '&sort=' + encodeURIComponent(sort)
+      + (genre ? '&genre=' + encodeURIComponent(genre) : '')
+      + (lang ? '&lang=' + encodeURIComponent(lang) : '')
+      + (year ? '&year=' + encodeURIComponent(year) : '')
+      + '&page=' + expTmdbPage;
+    var r = await api('/api/explore/tmdb' + qs);
+    var data = await r.json().catch(function () { return null; });
+    if (!r.ok) {
+      if (reset) grid.innerHTML = '';
+      if (data && data.error && data.error.code === 'tmdb_not_configured') {
+        guide.innerHTML = '<div class="guide-card"><h3>TMDB API Key 尚未配置</h3><p class="muted" style="margin:0 0 .7rem">配置 TMDB API Key 后即可按题材、地区、年份浏览 TMDB 全库。也可以先切换「豆瓣榜单」逛热门片单。</p><button type="button" class="btn btn-primary btn-sm" id="exp-tmdb-cfg-btn">去配置 TMDB Key</button></div>';
+        document.getElementById('exp-tmdb-cfg-btn').addEventListener('click', function () { switchView('settings'); switchSettingsTab('tmdb'); });
+      } else {
+        toast(data && data.error ? data.error.message : '加载 TMDB 探索失败', 'error');
+      }
+      return;
+    }
+    var items = data.items || [];
+    if (reset) {
+      grid.innerHTML = items.length ? items.map(expCardHtml).join('') : '<div class="empty-state" style="grid-column:1/-1"><p>没有符合筛选条件的影视作品。</p></div>';
+    } else if (items.length) {
+      grid.insertAdjacentHTML('beforeend', items.map(expCardHtml).join(''));
+    }
+    expTmdbTotalPages = data.total_pages || 1;
+    moreBtn.hidden = expTmdbPage >= expTmdbTotalPages;
+  } finally {
+    expTmdbLoading = false;
+    setBtnLoading(moreBtn, false);
+  }
+}
+
+var tmdbTypeBtns = document.querySelectorAll('[data-tmdb-type]');
+for (var tti = 0; tti < tmdbTypeBtns.length; tti++) {
+  tmdbTypeBtns[tti].addEventListener('click', function () {
+    expTmdbType = this.getAttribute('data-tmdb-type') || 'tv';
+    setTmdbTypeButtons(expTmdbType);
+    loadTmdbExplore(true);
+  });
+}
+['exp-tmdb-sort', 'exp-tmdb-genre', 'exp-tmdb-lang', 'exp-tmdb-year'].forEach(function (id) {
+  document.getElementById(id).addEventListener('change', function () { loadTmdbExplore(true); });
+});
+document.getElementById('exp-tmdb-more').addEventListener('click', function () {
+  expTmdbPage += 1;
+  loadTmdbExplore(false);
+});
+document.getElementById('exp-tmdb-grid').addEventListener('click', function (e) {
+  var card = e.target.closest('.exp-card[data-exp-id]');
+  if (card) openExploreCard(card);
+});
+
+function selectDoubanCollection(col) {
+  expDoubanCol = col;
+  var pills = document.querySelectorAll('[data-dbcol]');
+  for (var i = 0; i < pills.length; i++) pills[i].classList.toggle('active', pills[i].getAttribute('data-dbcol') === col);
+  loadDoubanExplore(true);
+}
+async function loadDoubanExplore(reset) {
+  if (expDoubanLoading) return;
+  expDoubanLoading = true;
+  var grid = document.getElementById('exp-douban-grid');
+  var moreBtn = document.getElementById('exp-douban-more');
+  if (reset) {
+    expDoubanStart = 0;
+    grid.innerHTML = '<div class="skeleton" style="aspect-ratio:2/3;border-radius:12px"></div>'.repeat(12);
+    moreBtn.hidden = true;
+  } else {
+    setBtnLoading(moreBtn, true);
+  }
+  try {
+    var r = await api('/api/explore/douban?collection=' + encodeURIComponent(expDoubanCol) + '&start=' + expDoubanStart + '&count=20');
+    var data = await r.json().catch(function () { return null; });
+    if (!r.ok || !data) {
+      if (reset) grid.innerHTML = '<div class="empty-state" style="grid-column:1/-1"><p>豆瓣榜单暂不可用，请稍后重试。</p></div>';
+      toast(data && data.error ? data.error.message : '加载豆瓣榜单失败', 'error');
+      return;
+    }
+    var items = data.items || [];
+    if (reset) {
+      grid.innerHTML = items.length ? items.map(expCardHtml).join('') : '<div class="empty-state" style="grid-column:1/-1"><p>该榜单暂无条目。</p></div>';
+    } else if (items.length) {
+      grid.insertAdjacentHTML('beforeend', items.map(expCardHtml).join(''));
+    }
+    expDoubanStart += items.length;
+    expDoubanHasMore = !!data.has_more;
+    moreBtn.hidden = !expDoubanHasMore;
+  } finally {
+    expDoubanLoading = false;
+    setBtnLoading(moreBtn, false);
+  }
+}
+document.getElementById('exp-douban-pills').addEventListener('click', function (e) {
+  var btn = e.target.closest('button[data-dbcol]');
+  if (!btn) return;
+  selectDoubanCollection(btn.getAttribute('data-dbcol') || 'tv_hot');
+});
+document.getElementById('exp-douban-more').addEventListener('click', function () {
+  loadDoubanExplore(false);
+});
+document.getElementById('exp-douban-grid').addEventListener('click', function (e) {
+  var card = e.target.closest('.exp-card[data-exp-id]');
+  if (card) openExploreCard(card);
+});
+
+async function openExploreCard(cardEl) {
+  var item = expItemMap[cardEl.getAttribute('data-exp-id')];
+  if (!item) return;
+  if (item.source === 'tmdb' && item.tmdb_id) {
+    openDetail({ tmdb_id: item.tmdb_id, media_type: item.media_type === 'movie' ? 'movie' : 'tv' });
+    return;
+  }
+  cardEl.classList.add('is-loading');
+  try {
+    var qs = '?title=' + encodeURIComponent(item.title)
+      + '&media_type=' + encodeURIComponent(item.media_type)
+      + (item.year ? '&year=' + item.year : '');
+    var r = await api('/api/explore/match' + qs);
+    var data = await r.json().catch(function () { return null; });
+    if (data && data.tmdb_configured && data.matched && data.matched.tmdb_id) {
+      openDetail({ tmdb_id: data.matched.tmdb_id, media_type: data.matched.media_type }, item.media_type === 'variety' ? 'variety' : null);
+      return;
+    }
+    openQuickSubscribeModal(item);
+  } finally {
+    cardEl.classList.remove('is-loading');
+  }
+}
+
+function openQuickSubscribeModal(item) {
+  var box = document.getElementById('modal-content');
+  var poster = item.poster_url
+    ? '<img src="' + esc(item.poster_url) + '" alt="">'
+    : '<div class="poster-ph">' + esc((item.title || '?').slice(0, 1)) + '</div>';
+  var mType = item.media_type || 'tv';
+  var isMovie = mType === 'movie';
+  box.innerHTML = '<div class="modal-hero">' + poster
+    + '<div style="flex:1;min-width:0"><div class="modal-title">' + esc(item.title)
+    + (item.year ? ' <span class="sub-year num">' + item.year + '</span>' : '') + '</div>'
+    + '<div class="tag-row"><span class="tag">豆瓣榜单</span>'
+    + '<span class="tag">' + mediaLabel(mType) + '</span>'
+    + (item.region ? '<span class="tag">' + esc(item.region) + '</span>' : '')
+    + (item.rating ? '<span class="tag tag-rate">★ ' + Number(item.rating).toFixed(1) + '</span>' : '') + '</div>'
+    + '<div class="form-grid-3" style="margin-top:.8rem">'
+    + '<div class="field"><label class="field-label" for="qm-type">类型</label>'
+    + '<select id="qm-type"><option value="tv"' + (mType === 'tv' ? ' selected' : '') + '>电视剧</option>'
+    + '<option value="movie"' + (mType === 'movie' ? ' selected' : '') + '>电影</option>'
+    + '<option value="variety"' + (mType === 'variety' ? ' selected' : '') + '>综艺</option></select></div>'
+    + (!isMovie ? '<div class="field"><label class="field-label" for="qm-season">订阅季</label><input id="qm-season" type="number" min="1" value="1"></div>' : '<div></div>')
+    + '<div class="field"><label class="field-label" for="qm-mode">执行模式</label>'
+    + '<select id="qm-mode"><option value="auto" selected>自动转存</option><option value="manual">手动确认</option></select></div>'
+    + '</div></div></div>'
+    + (item.subtitle ? '<p class="muted" style="margin-top:.85rem">' + esc(item.subtitle) + '</p>' : '')
+    + (item.overview ? '<div class="modal-section"><div class="modal-section-title">简介</div><p class="overview">' + esc(item.overview) + '</p></div>' : '')
+    + '<div class="modal-actions"><button type="button" class="btn" id="qm-cancel">取消</button>'
+    + '<button type="button" class="btn btn-primary" id="qm-submit">确认订阅</button></div>';
+  enhanceSelects(box);
+  document.getElementById('modal-backdrop').hidden = false;
+  document.getElementById('qm-cancel').addEventListener('click', closeModal);
+  document.getElementById('qm-submit').addEventListener('click', async function () {
+    var btn = this;
+    setBtnLoading(btn, true);
+    try {
+      var mt = document.getElementById('qm-type').value;
+      var sEl = document.getElementById('qm-season');
+      var payload = {
+        title: item.title,
+        year: item.year,
+        media_type: mt,
+        region: item.region || undefined,
+        season: mt === 'movie' ? undefined : (sEl && Number(sEl.value) ? Number(sEl.value) : 1),
+        rating: item.rating,
+        overview: item.overview || item.subtitle || undefined,
+        mode: document.getElementById('qm-mode').value
+      };
+      var r = await api('/api/subscriptions', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      var data = await r.json().catch(function () { return null; });
+      if (!r.ok) { toast(data && data.error ? data.error.message : '订阅失败', 'error'); return; }
+      closeModal();
+      toast('已添加订阅「' + item.title + '」', 'success');
+      await loadSubs();
+    } finally {
+      setBtnLoading(btn, false);
+    }
+  });
+}
 
 /* ---------- Init ---------- */
 var initial = document.body.getAttribute('data-initial-view') || 'dashboard';

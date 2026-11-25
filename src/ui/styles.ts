@@ -1118,6 +1118,175 @@ export const APP_CSS = `
   }
   .guide-card h3 { margin: 0 0 0.35rem; color: var(--pp-text); }
 
+  /* ---- Explore (MoviePilot-inspired shelves & grids) ---- */
+  .exp-topbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 1.25rem;
+  }
+  .exp-panel { display: none; }
+  .exp-panel.active { display: block; animation: pp-fade-in 0.18s var(--pp-ease); }
+
+  .exp-shelf { margin-bottom: 1.65rem; }
+  .exp-shelf-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+  .exp-shelf-title-wrap { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+  .exp-shelf-title { margin: 0; font-size: 1.06rem; font-weight: 700; letter-spacing: -0.01em; }
+  .exp-src-tag {
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 0.1rem 0.45rem;
+    border-radius: 5px;
+    letter-spacing: 0.02em;
+    flex: 0 0 auto;
+  }
+  .exp-src-tmdb { background: var(--pp-sky-soft); color: var(--pp-sky); }
+  .exp-src-douban { background: var(--pp-green-soft); color: var(--pp-green); }
+
+  .exp-track-wrap { position: relative; }
+  .exp-track {
+    display: flex;
+    gap: 0.9rem;
+    overflow-x: auto;
+    scroll-behavior: smooth;
+    scroll-snap-type: x proximity;
+    padding: 0.15rem 0.05rem 0.4rem;
+    scrollbar-width: none;
+  }
+  .exp-track::-webkit-scrollbar { display: none; }
+  .exp-track .exp-card { flex: 0 0 158px; scroll-snap-align: start; }
+
+  .exp-scroll-btn {
+    position: absolute;
+    top: 38%;
+    transform: translateY(-50%);
+    z-index: 4;
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 1px solid var(--pp-border-strong);
+    background: var(--pp-topbar-bg);
+    backdrop-filter: blur(8px);
+    color: var(--pp-text);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    box-shadow: var(--pp-shadow);
+    opacity: 0;
+    transition: opacity 0.16s, background 0.15s, border-color 0.15s;
+  }
+  .exp-track-wrap:hover .exp-scroll-btn { opacity: 1; }
+  .exp-scroll-btn:hover { background: var(--pp-panel-2); border-color: var(--pp-accent); color: var(--pp-accent); }
+  .exp-scroll-prev { left: 6px; }
+  .exp-scroll-next { right: 6px; }
+
+  .exp-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+    gap: 1rem;
+  }
+  .exp-card {
+    position: relative;
+    background: var(--pp-panel);
+    border: 1px solid var(--pp-border);
+    border-radius: var(--pp-radius);
+    overflow: hidden;
+    cursor: pointer;
+    transition: transform 0.18s var(--pp-ease), border-color 0.18s, box-shadow 0.18s;
+  }
+  .exp-card:hover {
+    transform: translateY(-3px);
+    border-color: var(--pp-accent-border);
+    box-shadow: var(--pp-shadow);
+  }
+  .exp-card.is-loading { pointer-events: none; opacity: 0.65; }
+  .exp-poster {
+    position: relative;
+    aspect-ratio: 2 / 3;
+    background: var(--pp-panel-2);
+    overflow: hidden;
+  }
+  .exp-poster img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    transition: transform 0.3s var(--pp-ease);
+  }
+  .exp-card:hover .exp-poster img { transform: scale(1.04); }
+  .exp-sub-badge {
+    position: absolute;
+    top: 7px;
+    right: 7px;
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 0.14rem 0.45rem;
+    border-radius: 5px;
+    background: rgba(13, 150, 104, 0.92);
+    color: #fff;
+    box-shadow: var(--pp-shadow-sm);
+  }
+  .exp-ep-badge {
+    position: absolute;
+    left: 7px;
+    bottom: 7px;
+    max-width: calc(100% - 62px);
+    font-size: 0.68rem;
+    font-weight: 600;
+    padding: 0.12rem 0.42rem;
+    border-radius: 5px;
+    background: rgba(9, 9, 11, 0.78);
+    color: #e5e7eb;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    backdrop-filter: blur(4px);
+  }
+  .exp-info { padding: 0.62rem 0.72rem 0.74rem; }
+  .exp-title {
+    font-weight: 630;
+    font-size: 0.9rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .exp-meta {
+    color: var(--pp-muted);
+    font-size: 0.76rem;
+    margin-top: 0.2rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .exp-filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+    padding: 0.85rem 1rem;
+    background: var(--pp-panel);
+    border: 1px solid var(--pp-border);
+    border-radius: var(--pp-radius);
+    margin-bottom: 1.15rem;
+  }
+  .exp-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.42rem;
+    margin-bottom: 1.15rem;
+  }
+  .exp-more-wrap { text-align: center; margin-top: 1.35rem; }
+
   /* ---- Logs View ---- */
   .logs-toolbar {
     display: flex;
@@ -1498,7 +1667,7 @@ export const APP_CSS = `
 
     .mobile-tabs {
       display: grid;
-      grid-template-columns: repeat(5, 1fr);
+      grid-template-columns: repeat(6, 1fr);
       position: fixed;
       left: 0;
       right: 0;
@@ -1507,7 +1676,7 @@ export const APP_CSS = `
       background: var(--pp-topbar-bg);
       backdrop-filter: blur(12px);
       border-top: 1px solid var(--pp-border);
-      padding: 0.35rem 0.25rem calc(0.35rem + env(safe-area-inset-bottom, 0px));
+      padding: 0.35rem 0.15rem calc(0.35rem + env(safe-area-inset-bottom, 0px));
     }
     .mobile-tab {
       position: relative;
@@ -1518,12 +1687,15 @@ export const APP_CSS = `
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 0.16rem;
-      padding: 0.35rem 0.2rem;
-      font-size: 0.7rem;
+      gap: 0.14rem;
+      padding: 0.34rem 0.1rem;
+      font-size: 0.66rem;
       font-weight: 550;
       cursor: pointer;
     }
+    .exp-scroll-btn { display: none; }
+    .exp-track .exp-card { flex: 0 0 138px; }
+    .exp-grid { grid-template-columns: repeat(auto-fill, minmax(144px, 1fr)); gap: 0.78rem; }
     .mobile-tab.active { color: var(--pp-accent); font-weight: 650; }
     .mobile-tab .nav-dot {
       position: absolute;

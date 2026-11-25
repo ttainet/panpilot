@@ -159,6 +159,14 @@ import {
   type WecomPublicConfig,
   type WecomSecrets,
 } from "./wecom";
+import {
+  cleanMediaTitle,
+  fetchDoubanExplore,
+  fetchTmdbExplore,
+  handleExploreImg,
+  pickBestTmdbMatch,
+  type ExploreMediaType,
+} from "./explore";
 
 export interface Env {
   DB?: D1Database;
@@ -3120,6 +3128,9 @@ export default {
       if (pathname === "/subscriptions") {
         return new Response(appHtml("subscriptions"), { headers: { "content-type": "text/html; charset=utf-8" } });
       }
+      if (pathname === "/explore") {
+        return new Response(appHtml("explore"), { headers: { "content-type": "text/html; charset=utf-8" } });
+      }
       if (pathname === "/discover") {
         return new Response(appHtml("discover"), { headers: { "content-type": "text/html; charset=utf-8" } });
       }
@@ -3175,8 +3186,55 @@ export default {
       if (pathname === "/api/tmdb/search" && req.method === "GET") return handleTmdbSearch(url, store);
       if (pathname === "/api/tmdb/details" && req.method === "GET") return handleTmdbDetails(url, store);
 
+      if (pathname === "/api/explore/img" && req.method === "GET") {
+        return handleExploreImg(url.searchParams.get("url"));
+      }
+      if (pathname === "/api/explore/tmdb" && req.method === "GET") {
+        const dirs = await getEffectiveDirectories(store);
+        const res = await fetchTmdbExplore(url, (p) => tmdbFetch(store, p), dirs);
+        if (res.errorResponse) return res.errorResponse;
+        return json({ items: res.items ?? [], page: res.page ?? 1, total_pages: res.total_pages ?? 1 });
+      }
+      if (pathname === "/api/explore/douban" && req.method === "GET") {
+        const collection = url.searchParams.get("collection") || "tv_hot";
+        const start = Number(url.searchParams.get("start") ?? "0");
+        const count = Number(url.searchParams.get("count") ?? "20");
+        const dirs = await getEffectiveDirectories(store);
+        try {
+          const data = await fetchDoubanExplore(collection, start, count, dirs);
+          return json(data);
+        } catch (e) {
+          return err("douban_upstream_error", e instanceof Error ? e.message : String(e), 502);
+        }
+      }
+      if (pathname === "/api/explore/match" && req.method === "GET") {
+        const title = url.searchParams.get("title")?.trim() ?? "";
+        if (!title) return err("bad_request", "title is required", 400);
+        const mediaType = (url.searchParams.get("media_type") || "tv") as ExploreMediaType;
+        const yearRaw = Number(url.searchParams.get("year") ?? "");
+        const year = Number.isFinite(yearRaw) && yearRaw > 1900 ? yearRaw : undefined;
+        const { results, errorCode } = await searchTmdbItems(store, cleanMediaTitle(title) || title);
+        if (!results) {
+          return json({ tmdb_configured: errorCode !== "tmdb_not_configured", matched: null });
+        }
+        const matched = pickBestTmdbMatch(
+          results.map((r) => ({ ...r, media_type: r.media_type === "movie" ? "movie" : "tv" })),
+          title,
+          mediaType,
+          year,
+        );
+        return json({ tmdb_configured: true, matched });
+      }
+
       if (pathname === "/api/wecom/menu/sync" && req.method === "POST") return handleWecomSyncMenu(url, store, env);
       if (pathname === "/api/wecom/test" && req.method === "POST") return handleWecomTest(store, env);
+
+      if (pathname === "/api/agent-guide" && req.method === "GET") {
+        return new Response(JSON.stringify({ guide: AI_DRIVER_GUIDE_MD, version: VERSION }), {
+          status: 200,
+          headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+        });
+      }
 
       return err("not_found", "not found", 404);
     } catch (e) {
