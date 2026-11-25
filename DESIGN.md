@@ -1,7 +1,7 @@
-# PanPilot 设计稿 v0.9（已部署上线）
+# PanPilot 设计稿 v0.9
 
-> 状态：v0.9 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
-> 线上验证（health 为 store=d1、登录与 Driver 鉴权正常）。本文档描述目标架构与接口契约。
+> 状态：v0.9。本文档描述目标架构与接口契约；部署方式见 README 的部署章节
+> （部署到你自己的 Cloudflare 账号与域名）。
 >
 > v0.9 变更：AI Driver 手册（docs/AI_DRIVER_GUIDE.md §5）把目录与命名规则重写为
 > 明确无歧义的决策顺序 + 精确模板 + 正反例（先盘点复用已有剧名夹、季集解析规则、
@@ -15,7 +15,7 @@
 > 调整，不改任何接口、字段与行为。
 >
 > v0.7 变更（用户拍板）：(1) **入库目录成为一等设置**（settings 键 `directories`，
-> 默认值与用户夸克真实结构一致：根「电影电视剧」下只有电视剧/电影两夹；电视剧下
+> 默认值参考一套实际在用的夸克影视库结构：根「电影电视剧」下只有电视剧/电影两夹；电视剧下
 > 地区夹为国产剧/欧美剧/**日韩剧（日韩合并）**，国漫/纪录片/综艺同在电视剧下；
 > 电影下为华语电影/外语电影/动画电影）。设置页可改路径、三个映射与命名模板，
 > `GET /api/driver/config` 返回生效值；**分类一律以 directories 设置为准**——
@@ -102,7 +102,7 @@ Secret 中，不进 D1/代码/日志）。网页端永远看不到 Cookie（明�
 ## 3. 用户目录规范（Driver 入库必须遵守）
 
 规范由 settings 键 `directories` 定义（见 §4.6），**分类以该设置为准**；
-默认值来自用户夸克的真实结构（2026-11-25 经 Cookie 用 API 实读确认）：
+默认值参考一套实际在用的夸克影视库结构：
 
 ```
 电影电视剧（base_dir）
@@ -398,7 +398,7 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
 
 已定（2026-11-25 用户拍板，均已实现并本地验证）：
 
-1. ~~部署域名 + 网页端鉴权~~ **已定**：域名 `panpilot.ttai.net`（GitHub 仓库：
+1. ~~部署域名 + 网页端鉴权~~ **已定**：部署到自有域名（GitHub 仓库：
    `github.com/ttainet/panpilot`）；网页端用**简单的账号密码登录**
    （`APP_USERNAME` / `APP_PASSWORD` Secrets + HMAC 签名会话 Cookie），不用 Cloudflare Access。
 2. ~~Driver v1 唤醒频率~~ **已定**：**每 6 小时一轮**（`CHECK_INTERVAL_HOURS=6`；
@@ -429,7 +429,7 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
 已定（2026-11-25 用户追加拍板，v0.7 已实现并本地验证）：
 
 8. **入库目录以设置为准 + AI Driver 文档**：目录规范做成 settings 键
-   `directories`（默认值按用户夸克真实结构：日韩合并、国漫/纪录片/综艺在
+   `directories`（默认值参考实际在用的夸克影视库结构：日韩合并、国漫/纪录片/综艺在
    电视剧下、电影三分类），设置页可改、Driver config 下发生效值、TMDB
    分类映射与之对齐；同时为「未来的 AI Driver」提供操作手册三处落点
    （`docs/AI_DRIVER_GUIDE.md` / 根 `AGENTS.md` / `GET /api/driver/agent-guide`），

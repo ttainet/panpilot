@@ -21,7 +21,7 @@ PanPilot 是一个影视订阅**控制面**（Cloudflare Workers + D1）。用�
 → 用 Cookie 调夸克接口选集转存到目标文件夹 → 按模板重命名 → 复核 → 回写进度
 ```
 
-- 控制面地址（下称 `BASE`）：`https://panpilot.ttai.net`（自部署时换成你的实例域名）。
+- 控制面地址（下称 `BASE`）：`https://your-panpilot.example.com`（占位示例，换成你被授权访问的实例域名）。
 - 你与控制面之间只有 §2 的 Driver API。不要试图绕过 API 直接改数据。
 - **夸克实际目录是进度的唯一真相**；控制面里的 episodes 记录只是缓存，
   与实际目录冲突时以实际目录为准，并通过 progress 回写修正。

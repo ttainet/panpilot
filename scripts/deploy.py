@@ -8,7 +8,12 @@ api.cloudflare.com. Nothing secret is printed; generated secret values are
 only reported as "set".
 
 Usage:
-  python3 scripts/deploy.py [--step d1|migrate|bundle|upload|secrets|enc-secret|domain|toml|all]
+  PANPILOT_DOMAIN=<your-domain> python3 scripts/deploy.py [--step d1|migrate|bundle|upload|secrets|enc-secret|domain|toml|all]
+
+The target hostname is NOT hardcoded: the `domain` step reads it from the
+PANPILOT_DOMAIN environment variable and fails with a clear message when it
+is unset. The Cloudflare zone is resolved from that hostname via the API,
+so no zone id or zone name is baked into this script either.
 
 The `enc-secret` step (v0.5) only ensures COOKIE_ENC_SECRET exists: it lists
 the script's secret names and generates the value solely when missing, so
@@ -45,7 +50,17 @@ from dynamic_credentials import add_surrogate_to_request  # noqa: E402
 ACCOUNT_ID = "3941996c4a5fc4834c26be4b138b0ce7"
 BASE = "https://api.cloudflare.com/client/v4"
 SCRIPT_NAME = "panpilot"
-HOSTNAME = "panpilot.ttai.net"
+HOSTNAME = os.environ.get("PANPILOT_DOMAIN", "").strip()
+
+
+def require_hostname() -> str:
+    """The deployment hostname comes from the PANPILOT_DOMAIN env var —
+    it is deliberately not hardcoded in this public script."""
+    if not HOSTNAME:
+        print("[domain] FAILED: PANPILOT_DOMAIN is not set. "
+              "Run with e.g. PANPILOT_DOMAIN=panpilot.example.com")
+        sys.exit(1)
+    return HOSTNAME
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_PATH = os.path.join(ROOT, "scripts", "deploy-state.json")
 DRIVER_TOKEN_PATH = os.path.join(ROOT, ".driver-token")
@@ -326,23 +341,45 @@ def step_enc_secret() -> None:
 # Step: custom domain binding
 # ---------------------------------------------------------------------------
 
-TTAI_ZONE_ID = "46521058f972d036db6b926b0d18a7f5"  # ttai.net
+_ZONE_CACHE: tuple[str, str] | None = None
+
+
+def resolve_zone() -> tuple[str, str]:
+    """Resolve the Cloudflare zone (id, name) containing HOSTNAME by asking
+    the API for progressively shorter suffixes of the hostname — no zone id
+    or zone name is hardcoded."""
+    global _ZONE_CACHE
+    if _ZONE_CACHE:
+        return _ZONE_CACHE
+    hostname = require_hostname()
+    labels = hostname.split(".")
+    for i in range(len(labels) - 1):
+        candidate = ".".join(labels[i:])
+        status, payload = api("GET", f"/zones?name={candidate}")
+        if status == 200 and payload.get("success") and payload.get("result"):
+            zone = payload["result"][0]
+            _ZONE_CACHE = (zone["id"], zone["name"])
+            return _ZONE_CACHE
+    print(f"[domain] FAILED: no Cloudflare zone found for hostname {hostname}")
+    sys.exit(1)
 
 
 def step_domain() -> None:
+    hostname = require_hostname()
     status, payload = api("GET", f"/accounts/{ACCOUNT_ID}/workers/domains?per_page=100")
     if status == 200 and payload.get("success"):
         for d in payload.get("result", []):
-            if d.get("hostname") == HOSTNAME:
-                print(f"[domain] {HOSTNAME} already bound (id={d.get('id')})")
+            if d.get("hostname") == hostname:
+                print(f"[domain] {hostname} already bound (id={d.get('id')})")
                 return
+    zone_id, zone_name = resolve_zone()
     status, payload = api(
         "POST", f"/accounts/{ACCOUNT_ID}/workers/domains",
-        {"hostname": HOSTNAME, "service": SCRIPT_NAME, "environment": "production",
-         "zone_id": TTAI_ZONE_ID, "zone_name": "ttai.net"},
+        {"hostname": hostname, "service": SCRIPT_NAME, "environment": "production",
+         "zone_id": zone_id, "zone_name": zone_name},
     )
     if status == 200 and payload.get("success"):
-        print(f"[domain] bound {HOSTNAME} -> service {SCRIPT_NAME} (id={payload['result'].get('id')})")
+        print(f"[domain] bound {hostname} -> service {SCRIPT_NAME} (id={payload['result'].get('id')})")
         return
     errors = payload.get("errors") if isinstance(payload, dict) else None
     print(f"[domain] workers/domains POST rejected (http={status}, errors={json.dumps(errors, ensure_ascii=False)[:300]}); "
@@ -352,11 +389,13 @@ def step_domain() -> None:
 
 def _domain_via_route() -> None:
     """Classic equivalent of a custom domain: a zone-level Worker route for
-    panpilot.ttai.net/* plus a proxied placeholder DNS record so the hostname
+    <hostname>/* plus a proxied placeholder DNS record so the hostname
     resolves to Cloudflare (the Worker answers; the origin IP is never used).
     Universal SSL on the zone covers the hostname."""
-    pattern = f"{HOSTNAME}/*"
-    status, payload = api("GET", f"/zones/{TTAI_ZONE_ID}/workers/routes")
+    hostname = require_hostname()
+    zone_id, zone_name = resolve_zone()
+    pattern = f"{hostname}/*"
+    status, payload = api("GET", f"/zones/{zone_id}/workers/routes")
     if status == 200 and payload.get("success"):
         for r in payload.get("result", []):
             if r.get("pattern") == pattern and r.get("script") == SCRIPT_NAME:
@@ -364,7 +403,7 @@ def _domain_via_route() -> None:
                 break
         else:
             status2, payload2 = api(
-                "POST", f"/zones/{TTAI_ZONE_ID}/workers/routes",
+                "POST", f"/zones/{zone_id}/workers/routes",
                 {"pattern": pattern, "script": SCRIPT_NAME},
             )
             if status2 != 200 or not payload2.get("success"):
@@ -373,19 +412,20 @@ def _domain_via_route() -> None:
     else:
         fail("domain-route-list", status, payload)
 
-    status, payload = api("GET", f"/zones/{TTAI_ZONE_ID}/dns_records?name={HOSTNAME}")
+    status, payload = api("GET", f"/zones/{zone_id}/dns_records?name={hostname}")
     if status == 200 and payload.get("success") and payload.get("result"):
         rec = payload["result"][0]
-        print(f"[domain] DNS record for {HOSTNAME} already exists ({rec.get('type')} -> {rec.get('content')}, proxied={rec.get('proxied')})")
+        print(f"[domain] DNS record for {hostname} already exists ({rec.get('type')} -> {rec.get('content')}, proxied={rec.get('proxied')})")
         return
+    dns_name = hostname[: -(len(zone_name) + 1)] if hostname != zone_name else "@"
     status, payload = api(
-        "POST", f"/zones/{TTAI_ZONE_ID}/dns_records",
-        {"type": "A", "name": "panpilot", "content": "192.0.2.0", "proxied": True,
+        "POST", f"/zones/{zone_id}/dns_records",
+        {"type": "A", "name": dns_name, "content": "192.0.2.0", "proxied": True,
          "comment": "PanPilot Worker route placeholder (origin never contacted)"},
     )
     if status != 200 or not payload.get("success"):
         fail("domain-dns", status, payload)
-    print(f"[domain] created proxied DNS A record panpilot.ttai.net -> 192.0.2.0 (id={payload['result'].get('id')})")
+    print(f"[domain] created proxied DNS A record {hostname} -> 192.0.2.0 (id={payload['result'].get('id')})")
 
 
 # ---------------------------------------------------------------------------

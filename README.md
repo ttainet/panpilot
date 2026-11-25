@@ -1,17 +1,16 @@
 # PanPilot
 
-> Status: v0.9 — **deployed 2026-11-25** via the Cloudflare API to https://panpilot.ttai.net
-> (verified live: D1 store, password login, Driver auth); source is developed in the
-> public repository below.
-> 状态：v0.9 — **已于 2026-11-25 经 Cloudflare API 部署上线**并完成线上验证；源码在本仓库公开开发。设计见 [DESIGN.md](./DESIGN.md)。
+> Status: v0.9. Deploy it to your own Cloudflare account and your own domain —
+> see [Deployment](#部署--deployment) below. Design: [DESIGN.md](./DESIGN.md).
+> 状态：v0.9。部署到你自己的 Cloudflare 账号与域名，步骤见下方[部署](#部署--deployment)。设计见 [DESIGN.md](./DESIGN.md)。
 > v0.9 变更：AI Driver 手册的「目录与命名规范」重写为可直接执行的决策顺序与精确
 > 模板（先盘点复用已有剧名夹、季集解析、正反例、字幕跟随、同季不混版本、不确定
 > 就停）；`directories` 新增电影/综艺命名模板（movie_name_template /
 > variety_name_template），旧设置缺键自动补默认。
 > v0.8 变更：设置页按功能拆成 Tab（账号 / 媒体信息 / 网盘 / 搜索源 / 入库目录 / Driver），
 > Tab 状态写 URL hash、需关注的页签带红点提示；纯界面调整，接口与行为不变。
-> v0.7 新增：入库目录做成设置页可改的 `directories` 设置（默认值与用户夸克真实
-> 结构一致：日韩合并、国漫/纪录片/综艺在电视剧下、电影分华语/外语/动画），Driver
+> v0.7 新增：入库目录做成设置页可改的 `directories` 设置（默认值参考一套实际
+> 在用的夸克影视库结构：日韩合并、国漫/纪录片/综艺在电视剧下、电影分华语/外语/动画），Driver
 > config 下发生效值、TMDB 分类与之对齐；新增写给 AI Driver 的操作手册
 > （docs/AI_DRIVER_GUIDE.md、根目录 AGENTS.md、站内 `GET /api/driver/agent-guide`）。
 > v0.6 新增：Driver API Key 可在设置页按 Driver 命名创建/重置/吊销（服务端只存 SHA-256
@@ -21,7 +20,6 @@
 > TG 频道列表可在设置页配置（默认预填 2026-11-23 验证的 147 个有效频道）。
 
 **Repository / 仓库：** https://github.com/ttainet/panpilot
-**Live / 正式域名：** https://panpilot.ttai.net
 
 ## 简介 | Introduction
 
@@ -46,6 +44,106 @@ only your Driver can fetch it. See the security notes below.
 **控制面不保存任何网盘密码。** 夸克 Cookie 仅在你于设置页主动粘贴时保存，且只存
 AES-GCM 密文（密钥在 Worker Secret 中）；网页接口永不返回，仅你的 Driver 可取用。
 详见下方安全须知。不填 Cookie 时，Driver 可继续用其所在设备上的登录态执行。
+
+## AI Agent 接入 | Connect an AI Agent
+
+PanPilot 本身只做订阅与进度管理；真正执行搜索与转存的是外部 **Driver**。
+任何能发 HTTP 请求的 AI Agent（或程序）都可以按下面的路径从零接入，
+**不需要任何额外的口头交代** —— 完整操作手册就在系统里。
+
+An AI agent connects in four moves: get a key, read the manual, fetch the
+config, then run the work loop. All examples below use the placeholder
+instance `https://your-panpilot.example.com`.
+
+### 1. 前置条件 | Prerequisites
+
+- 已按下方[部署](#部署--deployment)部署好一个 PanPilot 实例。
+- 管理员先在网页**设置页**完成基础配置：TMDB API Key（设置 → 媒体信息）、
+  夸克 Cookie（设置 → 网盘）、TG 频道列表（设置 → 搜索源）、入库目录
+  （设置 → 入库目录）。这些是 Agent 干活要用的「原料」；缺哪样它会在
+  回报里点名提醒（例如 Cookie 未配置时只搜索、不转存）。
+
+### 2. 拿 Key | Get an API key
+
+管理员在 **设置 → Driver** 里为这个 Agent 创建一把命名的 **Driver API
+Key**（形如 `ppk_…`）。**明文只在创建/重置时显示一次**，请通过安全渠道
+（如加密文件、密码管理器）交给 Agent，不要贴进公开聊天、issue 或仓库。
+
+- **权限范围**：调用全部 `/api/driver/*` 接口 —— 读订阅与执行配置（含
+  夸克 Cookie、TMDB Key），回写候选与进度。**它拿不到网页登录凭据**，
+  也不能登录网页端；网页端与 Driver 是两套独立鉴权。
+- 服务端只存 Key 的 SHA-256 哈希；管理员可随时**重置**（旧 Key 立即
+  作废、发新 Key）或**吊销**某把 Key，不影响其他 Driver。
+- 部署时设置的 `DRIVER_TOKEN` Secret 是「系统引导 Key」，始终有效、
+  不在此列表中（见下方「登录与设置」一节）。
+
+### 3. 先读手册 | Read the manual first
+
+接入后第一件事是读操作手册 —— 目录/命名规范、候选评分、异常处理与
+安全红线都写死在里面，照着执行即可：
+
+```bash
+curl -H "Authorization: Bearer ppk_your_key_here" \
+  https://your-panpilot.example.com/api/driver/agent-guide
+```
+
+同一份手册也在仓库里：[AGENTS.md](./AGENTS.md)（精简版）与
+[docs/AI_DRIVER_GUIDE.md](./docs/AI_DRIVER_GUIDE.md)（详细版，源头）；
+三处内容保持同步，手册为源头。
+
+### 4. 取配置 | Fetch the runtime config
+
+每轮开始调一次 `GET /api/driver/config`，一次取齐本轮所需的一切：
+夸克 Cookie（解密明文，未配置为 `null`)、TMDB API Key、生效的 TG
+频道清单、入库目录与命名模板（`directories`）、检查间隔
+`check_interval_hours`。Agent 自己不需要保存任何其他凭据。
+
+### 5. 工作循环 | The work loop
+
+| 步 | 动作 |
+|---|---|
+| 1 | `GET /api/driver/pending` 拉到期、未集齐的订阅 |
+| 2 | `POST /api/driver/claim` 认领（租约防多 Driver 重复处理；409 就跳过本条） |
+| 3 | 按订阅的 TMDB 信息分析剧名 / 年份 / 季 / 总集数与缺集 |
+| 4 | 用 Cookie 盘点夸克**实际目录**（进度以实际目录为准），算出真实缺集 |
+| 5 | 按频道清单搜索（PanSou 或逐频道 `t.me/s`)，候选评分后 `POST /api/driver/candidates` 回报；只取缺集，大小异常的集跳过 |
+| 6 | auto 模式下选集转存到目标文件夹并按模板重命名；manual 模式回报后停下等用户在网页确认，**不擅自转存** |
+| 7 | 再列目录复核，`POST /api/driver/progress` 逐集回写；长任务用 `POST /api/driver/heartbeat` 续租 |
+| 8 | Cookie 失效时 `POST /api/driver/quark-status` 回报 `invalid` 并停下，**不要反复重试** |
+
+### 6. 接口速查 | API quick reference
+
+统一鉴权：请求头 `Authorization: Bearer <key>`；**无有效 Key 一律
+401**，拿不到任何数据。
+
+| 方法 & 路径 | 用途 |
+|---|---|
+| `GET /api/driver/agent-guide` | 操作手册全文（Markdown) |
+| `GET /api/driver/config` | 一次取齐 Cookie / TMDB Key / 频道 / 入库目录设置 |
+| `GET /api/driver/pending` | 拉到期订阅（含已存 / 缺集） |
+| `POST /api/driver/claim` | 认领订阅（租约） |
+| `POST /api/driver/candidates` | 回报候选分享与评分 |
+| `POST /api/driver/progress` | 回写每集入库状态与订阅进度 |
+| `POST /api/driver/heartbeat` | 续租 + 存活上报 |
+| `POST /api/driver/quark-status` | 回报夸克 Cookie 有效性（ok / invalid) |
+| `POST /api/driver/logs` | 上报运行日志（只写事件，禁止写密钥） |
+
+最小示例 | Minimal example:
+
+```bash
+BASE=https://your-panpilot.example.com
+KEY=ppk_your_key_here
+curl -H "Authorization: Bearer $KEY" $BASE/api/driver/config
+curl -H "Authorization: Bearer $KEY" "$BASE/api/driver/pending?limit=20"
+```
+
+### 7. 安全红线 | Safety red lines
+
+- API Key、夸克 Cookie、TMDB Key **绝不写入日志、进度备注、汇报、
+  代码仓库或截图**；只许存在于内存与 Agent 自己的受控配置中。
+- 只在入库目录树内建夹与转存；**不删除、不移动**用户已有文件。
+- 分类、季号、集号任一不确定时**停下来回报，不要猜**。
+- 完整红线与异常分支以手册为准（见本节第 3 步）。
 
 ## 界面 | Web UI
 
@@ -81,7 +179,7 @@ Browser ──(username/password login)──► Workers (PanPilot) ──► D1
 ```
 
 Library layout enforced by the Driver / Driver 入库目录规范（`directories`
-设置，设置页可改，默认值与用户夸克真实结构一致）：
+设置，设置页可改，默认值参考一套实际在用的夸克影视库结构）：
 
 ```
 电影电视剧 / 电视剧 / 地区分类（国产剧|欧美剧|日韩剧）或特殊分类（国漫|纪录片|综艺） / 剧名 (年份) / Season N
@@ -163,30 +261,11 @@ see [DESIGN.md](./DESIGN.md). 完整设计（表结构、Driver API、状态机�
 - **Library directories （入库目录）**: the settings page edits the folder layout
   the Driver files into — base/TV/movie folder names, the three category maps
   (TV regions, TV specials, movie categories) and the naming templates.
-  Defaults mirror the owner's real Quark structure (see above); the effective
+  Defaults follow a real-world Quark library layout (see above); the effective
   object is returned by `GET /api/settings` and shipped to Drivers in
   `GET /api/driver/config`. Invalid values are rejected with 400.
   设置页可编辑入库目录的路径、三组分类映射与命名模板；生效值经设置接口与
   Driver config 下发，非法值会被 400 拒绝，可一键恢复默认。
-
-## 给 AI Driver 的文档 | For AI Drivers
-
-If you are an AI agent (or a program) acting as a PanPilot **Driver**, start here:
-
-- **[AGENTS.md](./AGENTS.md)** — the concise brief: your role, auth, the
-  ten-step round, exception handling and the API list.
-- **[docs/AI_DRIVER_GUIDE.md](./docs/AI_DRIVER_GUIDE.md)** — the full
-  operating manual (source of truth): claim leases, inventory-before-search,
-  candidate scoring, the Quark API family, rename/verify/write-back,
-  cookie-invalid and other exception branches, and the security red lines.
-- **Online**: `GET /api/driver/agent-guide` on a deployed instance returns
-  the same full guide as Markdown (Driver API key required) — fetch it at
-  the start of a round if you have not read it.
-
-如果你是担任 Driver 的 AI 代理：先读 AGENTS.md 速览，再按
-docs/AI_DRIVER_GUIDE.md 详细手册执行；线上实例也可经
-`GET /api/driver/agent-guide`（需 Driver Key）取回手册全文。三处内容保持
-同步，手册为源头。
 
 ## 本地运行 | Run locally
 
@@ -211,10 +290,13 @@ back to an in-memory store. `GET /api/health` honestly reports which is active
 
 ## 部署 | Deployment
 
-> **Deployed on 2026-11-25 via the Cloudflare API** (not `wrangler deploy`),
-> using [`scripts/deploy.py`](./scripts/deploy.py) — the API credential is
-> supplied by the registered connector at runtime and never touches the repo,
-> env vars, or logs. 已于 2026-11-25 经 Cloudflare API 部署（脚本见 scripts/deploy.py）。
+> **Reference path: deploy via the Cloudflare API** (instead of
+> `wrangler deploy`) using [`scripts/deploy.py`](./scripts/deploy.py).
+> The script reads the target hostname from the `PANPILOT_DOMAIN`
+> environment variable; the Cloudflare API credential is supplied by your
+> own connector/tooling at runtime and never touches the repo or logs.
+> 参考路径：用 scripts/deploy.py 经 Cloudflare API 部署，目标域名经环境
+> 变量 `PANPILOT_DOMAIN` 传入，API 凭据由你自己的连接工具在运行时提供。
 
 What the script does / 脚本做的事：
 
@@ -236,12 +318,13 @@ What the script does / 脚本做的事：
    ensures `COOKIE_ENC_SECRET` exists (generating it solely when missing) and
    never rotates the other secrets. 已有部署的功能升级用分步执行 + `--step enc-secret`
    （仅补设缺失的 Cookie 加密密钥，绝不轮换已有 Secret）。
-4. Binds the hostname. Note: the Workers Custom Domains API rejected this
-   account's API token (`10405 Method not allowed for this authentication
-   scheme`), so the script falls back to the classic equivalent — a zone
-   Worker route `panpilot.ttai.net/*` → `panpilot` plus a proxied placeholder
-   DNS record. 自定义域 API 对本账号 Token 返回 10405，故用 Zone 路由 + 橙云
-   DNS 记录的等价方式绑定，效果一致。
+4. Binds the hostname given by `PANPILOT_DOMAIN`. Note: the Workers Custom
+   Domains API rejects some account API tokens (`10405 Method not allowed
+   for this authentication scheme`), so the script falls back to the classic
+   equivalent — a zone Worker route `<your-domain>/*` → `panpilot` plus a
+   proxied placeholder DNS record. 绑定 `PANPILOT_DOMAIN` 指定的域名；
+   自定义域 API 对部分账号 Token 会返回 10405，脚本回退到 Zone 路由 +
+   橙云 DNS 记录的等价方式，效果一致。
 5. Backfills the real `database_id` into `wrangler.toml`. 回填 database_id。
 
 For a fresh deployment with wrangler instead, the equivalent steps are:
