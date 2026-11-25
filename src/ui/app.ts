@@ -636,12 +636,12 @@ export function appHtml(initialView: string): string {
               <h2>Driver API Key 管理</h2>
               <span class="status-pill-box" id="driver-keys-status">加载中…</span>
             </div>
-            <p class="section-desc">Driver 需在请求头携带 <code>Authorization: Bearer &lt;Key&gt;</code> 才可拉取任务与配置（夸克 Cookie、TMDB Key、频道清单）。建议每个 Driver 单独创建一个 Key；明文<strong>仅在创建或重置时展示一次</strong>，服务端仅存 SHA-256 哈希。</p>
+            <p class="section-desc">每个 Driver 建议创建独立 Key（如 <code>claude-main</code> / <code>Muse</code>）。已配置 <code>COOKIE_ENC_SECRET</code> 时会在服务端 <strong>AES-GCM 加密存档</strong>，可直接点击每行右侧的「<strong>复制提示词</strong>」（自动带入该 Key 与名称作为 <code>driver_id</code>）或「<strong>复制 Key</strong>」发给 AI 立即开始工作。</p>
 
             <div id="driver-keys-list" style="margin-bottom:.9rem"></div>
 
             <div id="dk-once" class="once-vault" hidden>
-              <div class="once-vault-title">${ICON_KEY}<span>新 Key 只显示这一次，请立即复制保存到 Driver 配置：</span></div>
+              <div class="once-vault-title">${ICON_KEY}<span>当前未启用加密存档，新 Key 仅显示这一次，请立即复制保存：</span></div>
               <form class="input-group" id="dk-once-form">
                 <input id="dk-once-value" readonly autocomplete="off">
                 <button type="button" class="btn btn-primary" id="dk-copy-prompt">复制 AI 启动指令（含此 Key）</button>
@@ -654,7 +654,7 @@ export function appHtml(initialView: string): string {
               <div class="field">
                 <label class="field-label" for="dk-name">新建 Driver API Key</label>
                 <div class="input-group">
-                  <input id="dk-name" placeholder="输入 Driver 名称，如 claude-main / home-nas" autocomplete="off">
+                  <input id="dk-name" placeholder="输入 Driver 名称（同时用作 driver_id），如 claude-main / Muse" autocomplete="off">
                   <button type="submit" class="btn btn-primary">${ICON_PLUS}<span>新建 Key</span></button>
                 </div>
               </div>
@@ -665,40 +665,19 @@ export function appHtml(initialView: string): string {
 
           <div class="card" id="card-agent-guide">
             <div class="card-head">
-              <h2>AI Driver 启动指令 & 操作手册（agent-guide）</h2>
-              <span class="status-pill-box">网页端专属 · 支持带 Key 复制</span>
-            </div>
-            <p class="section-desc">新建 Key 后会自动临时带入下方启动指令；也可以手动粘贴已有 Key，一键复制完整指令发给 Claude / AI Driver 即可立即开始拉取订阅与转存。明文 Key <strong>仅在当前页面内存拼接，绝不保存</strong>。</p>
-
-            <div class="form-grid-2">
-              <div class="field">
-                <label class="field-label" for="ag-key-input">临时注入 API Key（仅本地内存拼接）</label>
-                <input id="ag-key-input" type="password" placeholder="新建 Key 自动带入，或粘贴已有 ppk_... Key" autocomplete="off">
-                <span class="field-hint" id="ag-key-hint">未填写时提示词中使用 &lt;YOUR_DRIVER_API_KEY&gt; 占位符</span>
-              </div>
-              <div class="field">
-                <label class="field-label" for="ag-driver-id">指定 driver_id</label>
-                <input id="ag-driver-id" value="ai-driver" placeholder="如 claude-main / home-nas" autocomplete="off">
-                <span class="field-hint">AI 认领任务、续约和上报日志时使用的唯一身份标识</span>
+              <h2>AI 启动提示词模板 & 操作手册（agent-guide）</h2>
+              <div class="seg" role="tablist" aria-label="提示词模板模式">
+                <button type="button" class="seg-btn active" data-ag-mode="short">精简启动指令</button>
+                <button type="button" class="seg-btn" data-ag-mode="full">附带完整手册</button>
               </div>
             </div>
+            <p class="section-desc">在上方任一 Key 行点击「<strong>复制提示词</strong>」，会按下面选中的模式把该 Key 和名称自动填入模板（精简版让 AI 先自动拉取 <code>/api/driver/agent-guide</code>；若你的 AI 无法自行发 GET 请求，可切换为「附带完整手册」）。切勿把含明文 Key 的提示词发到公开渠道或截图。</p>
 
-            <div style="margin-top:.85rem">
-              <label class="switch-row" for="ag-include-key">
-                <div class="switch-text">
-                  <div class="switch-title">复制与预览时附带明文 API Key</div>
-                  <div class="switch-desc">仅发送给你信任的 AI 对话使用；切勿把含 Key 的指令发到公开渠道或截图</div>
-                </div>
-                <span class="switch"><input type="checkbox" id="ag-include-key" checked><span class="switch-track"></span></span>
-              </label>
-            </div>
-
-            <pre class="preview-terminal" id="ag-prompt-preview" style="white-space:pre-wrap;word-break:break-word;margin-top:.9rem">加载中…</pre>
+            <pre class="preview-terminal" id="ag-prompt-preview" style="white-space:pre-wrap;word-break:break-word;margin-top:.85rem">加载中…</pre>
 
             <div class="form-actions">
-              <button type="button" class="btn btn-primary" id="ag-copy-short">${ICON_COPY}<span>复制精简启动指令</span></button>
-              <button type="button" class="btn" id="ag-copy-full">${ICON_COPY}<span>复制完整手册 + 启动指令</span></button>
-              <button type="button" class="btn" id="ag-copy-guide">${ICON_COPY}<span>仅复制手册原文</span></button>
+              <button type="button" class="btn" id="ag-copy-template">${ICON_COPY}<span>复制纯模板（不含 Key）</span></button>
+              <button type="button" class="btn" id="ag-copy-guide">${ICON_COPY}<span>仅复制操作手册原文</span></button>
               <button type="button" class="btn btn-ghost" id="ag-toggle-full">展开完整手册全文</button>
             </div>
 

@@ -3,7 +3,9 @@ import {
   ICON_CHECK,
   ICON_CHEVRON,
   ICON_CHEVRON_LEFT,
+  ICON_COPY,
   ICON_INFO,
+  ICON_KEY,
   ICON_MOON,
   ICON_PAUSE,
   ICON_PLAY,
@@ -26,6 +28,8 @@ const ICON_JSON = JSON.stringify({
   alert: ICON_ALERT,
   chevron: ICON_CHEVRON,
   chevronLeft: ICON_CHEVRON_LEFT,
+  copy: ICON_COPY,
+  key: ICON_KEY,
 });
 
 export const APP_SCRIPT = `var ICONS = ${ICON_JSON};
@@ -1592,12 +1596,14 @@ async function ensureAgentGuide() {
   agentGuideCache = data.guide;
   return agentGuideCache;
 }
-function buildAiPrompt(fullGuideText) {
+var agPromptMode = 'short';
+var dkOnceMeta = { key: '', name: '' };
+
+function buildAiPrompt(opts) {
+  var o = opts || {};
   var base = location.origin;
-  var includeKey = document.getElementById('ag-include-key').checked;
-  var rawKey = (document.getElementById('ag-key-input').value || '').trim();
-  var keyDisplay = (includeKey && rawKey) ? rawKey : '<YOUR_DRIVER_API_KEY>';
-  var driverId = (document.getElementById('ag-driver-id').value || '').trim() || 'ai-driver';
+  var keyDisplay = o.key || '<所选 Key（点上方「复制提示词」自动填入）>';
+  var driverId = o.driverId || '<所选 Key 名称>';
   var lines = [
     '你是 PanPilot 的 AI Driver，请立即开始执行一轮影视订阅检查、搜索与夸克转存入库。',
     '',
@@ -1612,31 +1618,25 @@ function buildAiPrompt(fullGuideText) {
     '2. 拉取执行配置：GET ' + base + '/api/driver/config（一次取齐夸克 Cookie、TMDB Key、频道清单、目录与全局画质设置）',
     '3. 拉取到期订阅：GET ' + base + '/api/driver/pending?limit=20，按手册十步流程逐条 claim（409 跳过）→ 盘点夸克实际目录 → 搜索 → 筛选 → 转存 → 重命名 → 复核 → 回写 progress 与 logs。'
   ];
-  if (fullGuideText) {
-    lines.push('', '---', '', fullGuideText.split('https://your-panpilot.example.com').join(base));
+  if (o.fullGuideText) {
+    lines.push('', '---', '', o.fullGuideText.split('https://your-panpilot.example.com').join(base));
   }
   return lines.join('\n');
 }
 function renderAiPromptPreview() {
   var pre = document.getElementById('ag-prompt-preview');
-  var hint = document.getElementById('ag-key-hint');
-  var rawKey = (document.getElementById('ag-key-input').value || '').trim();
-  if (hint) {
-    hint.textContent = rawKey
-      ? ('当前已填入 Key（长度 ' + rawKey.length + ' 字符，仅存于当前页面内存）')
-      : '未填写时提示词中使用 <YOUR_DRIVER_API_KEY> 占位符';
+  if (!pre) return;
+  var txt = buildAiPrompt({});
+  if (agPromptMode === 'full') {
+    txt += '\n\n---（点击上方 Key 的「复制提示词」时，会自动在此处附带完整 agent-guide 操作手册全文）';
   }
-  if (pre) pre.textContent = buildAiPrompt(null);
+  pre.textContent = txt;
 }
 function showOnceKey(token, name) {
+  dkOnceMeta = { key: token || '', name: name || 'ai-driver' };
   var box = document.getElementById('dk-once');
   document.getElementById('dk-once-value').value = token;
   box.hidden = false;
-  var agKey = document.getElementById('ag-key-input');
-  var agDid = document.getElementById('ag-driver-id');
-  if (agKey) agKey.value = token;
-  if (agDid && name) agDid.value = name;
-  renderAiPromptPreview();
   box.scrollIntoView({ block: 'nearest' });
 }
 document.getElementById('dk-copy').addEventListener('click', function () {
@@ -1644,29 +1644,37 @@ document.getElementById('dk-copy').addEventListener('click', function () {
   document.getElementById('dk-msg').textContent = '已复制到剪贴板。';
   copyPlainText(input.value, 'API Key 已复制到剪贴板');
 });
-document.getElementById('dk-copy-prompt').addEventListener('click', function () {
-  var inc = document.getElementById('ag-include-key');
-  if (inc && !inc.checked) { inc.checked = true; renderAiPromptPreview(); }
-  copyPlainText(buildAiPrompt(null), '已复制含 Key 的 AI 启动指令');
+document.getElementById('dk-copy-prompt').addEventListener('click', async function () {
+  var btn = this;
+  setBtnLoading(btn, true);
+  try {
+    var guide = agPromptMode === 'full' ? await ensureAgentGuide() : null;
+    copyPlainText(buildAiPrompt({ key: dkOnceMeta.key, driverId: dkOnceMeta.name, fullGuideText: guide }), '已复制含 Key 的 AI 提示词');
+  } catch (e) {
+    toast(e && e.message ? e.message : '拉取手册失败', 'error');
+  } finally {
+    setBtnLoading(btn, false);
+  }
 });
 document.getElementById('dk-once-close').addEventListener('click', function () {
   document.getElementById('dk-once').hidden = true;
   document.getElementById('dk-once-value').value = '';
-  document.getElementById('ag-key-input').value = '';
-  renderAiPromptPreview();
+  dkOnceMeta = { key: '', name: '' };
 });
-document.getElementById('ag-key-input').addEventListener('input', renderAiPromptPreview);
-document.getElementById('ag-driver-id').addEventListener('input', renderAiPromptPreview);
-document.getElementById('ag-include-key').addEventListener('change', renderAiPromptPreview);
-document.getElementById('ag-copy-short').addEventListener('click', function () {
-  copyPlainText(buildAiPrompt(null), '已复制 AI 启动指令');
-});
-document.getElementById('ag-copy-full').addEventListener('click', async function () {
+var agModeBtns = document.querySelectorAll('[data-ag-mode]');
+for (var ami = 0; ami < agModeBtns.length; ami++) {
+  agModeBtns[ami].addEventListener('click', function () {
+    agPromptMode = this.getAttribute('data-ag-mode') === 'full' ? 'full' : 'short';
+    for (var j = 0; j < agModeBtns.length; j++) agModeBtns[j].classList.toggle('active', agModeBtns[j] === this);
+    renderAiPromptPreview();
+  });
+}
+document.getElementById('ag-copy-template').addEventListener('click', async function () {
   var btn = this;
   setBtnLoading(btn, true);
   try {
-    var guide = await ensureAgentGuide();
-    copyPlainText(buildAiPrompt(guide), '已复制完整操作手册 + 启动指令');
+    var guide = agPromptMode === 'full' ? await ensureAgentGuide() : null;
+    copyPlainText(buildAiPrompt({ fullGuideText: guide }), '已复制纯提示词模板（不含 Key）');
   } catch (e) {
     toast(e && e.message ? e.message : '拉取手册失败', 'error');
   } finally {
@@ -1724,23 +1732,86 @@ async function loadDriverKeys() {
   box.innerHTML = keys.map(function (k) {
     var isActive = !k.revoked_at;
     var actions = isActive
-      ? '<button type="button" class="btn btn-sm" data-dk-reset="' + k.id + '">重置</button>'
-        + '<button type="button" class="btn btn-sm btn-danger" data-dk-revoke="' + k.id + '">吊销</button>'
+      ? '<button type="button" class="btn btn-sm btn-primary" data-dk-copy-prompt="' + esc(k.id) + '" data-dk-name="' + esc(k.name) + '">' + ICONS.copy + '<span>复制提示词</span></button>'
+        + '<button type="button" class="btn btn-sm" data-dk-copy-key="' + esc(k.id) + '" data-dk-name="' + esc(k.name) + '">' + ICONS.key + '<span>复制 Key</span></button>'
+        + '<button type="button" class="btn btn-sm" data-dk-reset="' + esc(k.id) + '">重置</button>'
+        + '<button type="button" class="btn btn-sm btn-danger" data-dk-revoke="' + esc(k.id) + '">吊销</button>'
       : '';
+    var legacyHint = isActive && !k.can_copy ? ' · 旧 Key（点复制可一键重置启用）' : '';
     return '<div class="dk-row"><div class="dk-main">'
       + '<div class="dk-name">' + esc(k.name) + ' <code>' + esc(k.token_hint) + '</code>'
       + (isActive ? '<span class="badge b-done">有效</span>' : '<span class="badge b-paused">已吊销</span>')
       + '</div>'
       + '<div class="dk-sub num">创建于 ' + fmtTime(k.created_at)
       + ' · 最近使用：' + (k.last_used_at ? fmtTime(k.last_used_at) : '从未')
-      + (k.revoked_at ? ' · 吊销于 ' + fmtTime(k.revoked_at) : '') + '</div></div>'
+      + (k.revoked_at ? ' · 吊销于 ' + fmtTime(k.revoked_at) : '')
+      + legacyHint + '</div></div>'
       + '<div class="dk-actions">' + actions + '</div></div>';
   }).join('');
 }
+async function revealOrResetKey(id, name, actionLabel) {
+  var r = await api('/api/settings/driver-keys/' + encodeURIComponent(id) + '/reveal');
+  var d = await r.json().catch(function () { return null; });
+  if (r.ok && d && d.key) return { key: d.key, name: d.name || name };
+  if (d && d.error && d.error.code === 'key_not_recoverable') {
+    var ok = await confirmDialog({
+      title: '该旧 Key 未存档明文',
+      message: '「' + name + '」创建于加密存档之前，服务端仅存哈希无法反解。是否立即重置并生成新 Key 以便' + actionLabel + '？（旧 Key 将作废，重置后以后可随时一键复制）',
+      confirmText: '重置并' + actionLabel,
+      danger: true
+    });
+    if (!ok) return null;
+    var rr = await api('/api/settings/driver-keys/' + encodeURIComponent(id) + '/reset', { method: 'POST' });
+    var rd = await rr.json().catch(function () { return null; });
+    if (!rr.ok || !rd || !rd.key) {
+      toast(rd && rd.error ? rd.error.message : '重置失败', 'error');
+      return null;
+    }
+    if (!rd.stored_encrypted) showOnceKey(rd.key, rd.driver_key && rd.driver_key.name);
+    loadDriverKeys();
+    return { key: rd.key, name: (rd.driver_key && rd.driver_key.name) || name };
+  }
+  toast(d && d.error ? d.error.message : '读取 Key 失败', 'error');
+  return null;
+}
 document.getElementById('driver-keys-list').addEventListener('click', async function (e) {
+  var copyPromptBtn = e.target.closest('button[data-dk-copy-prompt]');
+  var copyKeyBtn = e.target.closest('button[data-dk-copy-key]');
   var resetBtn = e.target.closest('button[data-dk-reset]');
   var revokeBtn = e.target.closest('button[data-dk-revoke]');
   var msg = document.getElementById('dk-msg');
+  if (copyPromptBtn) {
+    var pid = copyPromptBtn.getAttribute('data-dk-copy-prompt');
+    var pname = copyPromptBtn.getAttribute('data-dk-name') || 'ai-driver';
+    setBtnLoading(copyPromptBtn, true);
+    try {
+      var resP = await revealOrResetKey(pid, pname, '复制提示词');
+      if (!resP) return;
+      var guide = agPromptMode === 'full' ? await ensureAgentGuide() : null;
+      var promptText = buildAiPrompt({ key: resP.key, driverId: resP.name, fullGuideText: guide });
+      copyPlainText(promptText, '已复制「' + resP.name + '」的 AI 启动提示词' + (guide ? '（含完整手册）' : ''));
+      msg.textContent = '已复制「' + resP.name + '」的 AI 启动提示词，可直接粘贴给 AI 开始执行。';
+    } catch (err) {
+      toast(err && err.message ? err.message : '复制提示词失败', 'error');
+    } finally {
+      setBtnLoading(copyPromptBtn, false);
+    }
+    return;
+  }
+  if (copyKeyBtn) {
+    var kid = copyKeyBtn.getAttribute('data-dk-copy-key');
+    var kname = copyKeyBtn.getAttribute('data-dk-name') || 'ai-driver';
+    setBtnLoading(copyKeyBtn, true);
+    try {
+      var resK = await revealOrResetKey(kid, kname, '复制 Key');
+      if (!resK) return;
+      copyPlainText(resK.key, '已复制「' + resK.name + '」的 API Key');
+      msg.textContent = '已复制「' + resK.name + '」的 API Key。';
+    } finally {
+      setBtnLoading(copyKeyBtn, false);
+    }
+    return;
+  }
   if (resetBtn) {
     var okReset = await confirmDialog({
       title: '重置 Driver API Key',
@@ -1757,9 +1828,15 @@ document.getElementById('driver-keys-list').addEventListener('click', async func
         var re = rd && rd.error ? rd.error.message : '重置失败';
         msg.textContent = re; toast(re, 'error'); return;
       }
-      msg.textContent = '已重置：旧 Key 已吊销，新 Key 请在上方复制（仅展示一次）。';
-      toast('Key 已重置，请立即复制保存', 'success');
-      showOnceKey(rd.key, rd.driver_key && rd.driver_key.name);
+      if (rd.stored_encrypted) {
+        document.getElementById('dk-once').hidden = true;
+        msg.textContent = '已重置：新 Key 已加密存档，直接点上方「复制提示词」或「复制 Key」即可。';
+        toast('Key 已重置，可随时一键复制', 'success');
+      } else {
+        msg.textContent = '已重置：旧 Key 已吊销，新 Key 请在上方复制（仅展示一次）。';
+        toast('Key 已重置，请立即复制保存', 'success');
+        showOnceKey(rd.key, rd.driver_key && rd.driver_key.name);
+      }
       loadDriverKeys();
     } finally {
       setBtnLoading(resetBtn, false);
@@ -1808,9 +1885,15 @@ document.getElementById('dk-form').addEventListener('submit', async function (e)
       msg.textContent = errText; toast(errText, 'error'); return;
     }
     document.getElementById('dk-name').value = '';
-    msg.textContent = '已创建：请把上方 Key 配置到 Driver 里（仅显示一次）。';
-    toast('已生成新的 Driver API Key', 'success');
-    showOnceKey(data.key, data.driver_key && data.driver_key.name);
+    if (data.stored_encrypted) {
+      document.getElementById('dk-once').hidden = true;
+      msg.textContent = '已生成「' + name + '」，点击列表中右侧「复制提示词」或「复制 Key」即可使用。';
+      toast('已生成「' + name + '」，可随时一键复制提示词或 Key', 'success');
+    } else {
+      msg.textContent = '已创建：请把上方 Key 配置到 Driver 里（仅显示一次）。';
+      toast('已生成新的 Driver API Key', 'success');
+      showOnceKey(data.key, data.driver_key && data.driver_key.name);
+    }
     loadDriverKeys();
   } finally {
     setBtnLoading(btn, false);

@@ -1582,9 +1582,36 @@ async function handleListLogs(url: URL, store: Store): Promise<Response> {
 
 // ---------------------------------------------------------------------------
 // Driver API keys (web API, v0.6) — named keys managed from the settings page.
-// Only SHA-256 hashes are stored; the plaintext token is returned exactly
-// once by create/reset and never again by any endpoint.
+// Only SHA-256 hashes are used for auth lookup; when COOKIE_ENC_SECRET is set,
+// we also archive an AES-256-GCM encrypted copy in `settings` so logged-in web
+// users can one-click copy the key or AI prompt anytime without re-creating.
 // ---------------------------------------------------------------------------
+
+const DRIVER_KEY_ENC_PREFIX = "driver_key_enc:";
+
+async function saveEncryptedDriverKey(store: Store, env: Env, id: string, token: string): Promise<boolean> {
+  const key = await cookieEncKey(env);
+  if (!key) return false;
+  const enc = await encryptText(key, token);
+  await store.setSetting(DRIVER_KEY_ENC_PREFIX + id, JSON.stringify(enc));
+  return true;
+}
+
+async function loadEncryptedDriverKey(store: Store, env: Env, id: string): Promise<string | null> {
+  const key = await cookieEncKey(env);
+  if (!key) return null;
+  const raw = await store.getSetting(DRIVER_KEY_ENC_PREFIX + id);
+  if (!raw) return null;
+  try {
+    return await decryptText(key, JSON.parse(raw) as { iv: string; ct: string });
+  } catch {
+    return null;
+  }
+}
+
+async function deleteEncryptedDriverKey(store: Store, id: string): Promise<void> {
+  await store.deleteSetting(DRIVER_KEY_ENC_PREFIX + id);
+}
 
 /** Generate a fresh Driver key: "ppk_" + 32 random bytes as hex. */
 function generateDriverKeyMaterial(): { token: string; hint: string } {
@@ -1612,45 +1639,65 @@ async function insertDriverKey(store: Store, name: string): Promise<{ record: Dr
   return { record, token };
 }
 
-/** GET /api/settings/driver-keys — list UI keys (hints only) + bootstrap status. */
+/** GET /api/settings/driver-keys — list UI keys (hints + can_copy flag) + bootstrap status. */
 async function handleListDriverKeys(store: Store, env: Env): Promise<Response> {
+  const encConfigured = !!(await cookieEncKey(env));
+  const keys = await store.listDriverKeys();
+  const enriched = await Promise.all(
+    keys.map(async (k) => ({
+      ...k,
+      can_copy: !k.revoked_at && encConfigured && !!(await store.getSetting(DRIVER_KEY_ENC_PREFIX + k.id)),
+    })),
+  );
   return json({
-    driver_keys: await store.listDriverKeys(),
+    driver_keys: enriched,
+    enc_configured: encConfigured,
     // The DRIVER_TOKEN secret is the bootstrap key: always valid, managed
     // via Worker secrets, intentionally not part of this list.
     bootstrap_key: { configured: !!env.DRIVER_TOKEN },
   });
 }
 
-/** POST /api/settings/driver-keys {name} → 201 with the plaintext key ONCE. */
-async function handleCreateDriverKey(req: Request, store: Store): Promise<Response> {
+/** POST /api/settings/driver-keys {name} → 201 with the plaintext key (+ encrypted archival if available). */
+async function handleCreateDriverKey(req: Request, store: Store, env: Env): Promise<Response> {
   const input = await body<{ name?: unknown }>(req);
   const name = typeof input?.name === "string" ? input.name.trim() : "";
   if (!name || name.length > 64 || /[\u0000-\u001f\u007f]/.test(name)) {
     return err("bad_request", "name is required (1–64 chars, no control characters)", 400);
   }
   const { record, token } = await insertDriverKey(store, name);
+  const storedEncrypted = await saveEncryptedDriverKey(store, env, record.id, token);
   await store.addLog({
     level: "info", event: "driver_key_created",
     detail: JSON.stringify({ id: record.id, name: record.name, hint: record.token_hint }),
   });
-  return json({ key: token, driver_key: publicDriverKey(record) }, 201);
+  return json({
+    key: token,
+    driver_key: { ...publicDriverKey(record), can_copy: storedEncrypted },
+    stored_encrypted: storedEncrypted,
+  }, 201);
 }
 
 /**
  * POST /api/settings/driver-keys/:id/reset — revoke the old row and issue a
- * new key under the same name. Returns the new plaintext ONCE.
+ * new key under the same name, archiving its encrypted copy when configured.
  */
-async function handleResetDriverKey(store: Store, id: string): Promise<Response> {
+async function handleResetDriverKey(store: Store, env: Env, id: string): Promise<Response> {
   const old = await store.getDriverKey(id);
   if (!old) return err("not_found", "driver key not found", 404);
   if (!old.revoked_at) await store.revokeDriverKey(id, now());
+  await deleteEncryptedDriverKey(store, old.id);
   const { record, token } = await insertDriverKey(store, old.name);
+  const storedEncrypted = await saveEncryptedDriverKey(store, env, record.id, token);
   await store.addLog({
     level: "info", event: "driver_key_reset",
     detail: JSON.stringify({ old_id: old.id, new_id: record.id, name: record.name, hint: record.token_hint }),
   });
-  return json({ key: token, driver_key: publicDriverKey(record) }, 201);
+  return json({
+    key: token,
+    driver_key: { ...publicDriverKey(record), can_copy: storedEncrypted },
+    stored_encrypted: storedEncrypted,
+  }, 201);
 }
 
 /** POST /api/settings/driver-keys/:id/revoke — idempotent. */
@@ -1659,11 +1706,28 @@ async function handleRevokeDriverKey(store: Store, id: string): Promise<Response
   if (!rec) return err("not_found", "driver key not found", 404);
   if (rec.revoked_at) return json({ ok: true, already_revoked: true });
   await store.revokeDriverKey(id, now());
+  await deleteEncryptedDriverKey(store, id);
   await store.addLog({
     level: "info", event: "driver_key_revoked",
     detail: JSON.stringify({ id: rec.id, name: rec.name, hint: rec.token_hint }),
   });
   return json({ ok: true });
+}
+
+/** GET /api/settings/driver-keys/:id/reveal — decrypt archived key for web UI one-click copy. */
+async function handleRevealDriverKey(store: Store, env: Env, id: string): Promise<Response> {
+  const rec = await store.getDriverKey(id);
+  if (!rec) return err("not_found", "driver key not found", 404);
+  if (rec.revoked_at) return err("key_revoked", "该 Key 已吊销，无法复制。", 400);
+  const token = await loadEncryptedDriverKey(store, env, id);
+  if (!token) {
+    return err(
+      "key_not_recoverable",
+      "该 Key 创建于加密存档之前，服务端未保存明文；请点击「重置」生成可随时复制的新 Key。",
+      404,
+    );
+  }
+  return json({ key: token, name: rec.name, driver_key: publicDriverKey(rec) });
 }
 
 // ---------------------------------------------------------------------------
@@ -3290,12 +3354,16 @@ export default {
       if (pathname === "/api/settings/driver-keys" || pathname.startsWith("/api/settings/driver-keys/")) {
         if (pathname === "/api/settings/driver-keys") {
           if (req.method === "GET") return handleListDriverKeys(store, env);
-          if (req.method === "POST") return handleCreateDriverKey(req, store);
+          if (req.method === "POST") return handleCreateDriverKey(req, store, env);
+        }
+        const rm = pathname.match(/^\/api\/settings\/driver-keys\/([^/]+)\/reveal$/);
+        if (rm && req.method === "GET") {
+          return handleRevealDriverKey(store, env, decodeURIComponent(rm[1]));
         }
         const km = pathname.match(/^\/api\/settings\/driver-keys\/([^/]+)\/(reset|revoke)$/);
         if (km && req.method === "POST") {
           const keyId = decodeURIComponent(km[1]);
-          if (km[2] === "reset") return handleResetDriverKey(store, keyId);
+          if (km[2] === "reset") return handleResetDriverKey(store, env, keyId);
           return handleRevokeDriverKey(store, keyId);
         }
         return err("not_found", "unknown driver-keys endpoint", 404);
