@@ -87,7 +87,7 @@ PanPilot 是一个影视订阅**控制面**（Cloudflare Workers + D1）。用�
   "tg_channels": ["…"],         // 本轮生效的 TG 频道清单（用户设置或默认 147）
   "tg_channels_priority_only": false,
   "tg_channels_priority_fallback": false,
-  "check_interval_hours": 6,
+  "check_interval_hours": 6,    // 最小检查间隔（小时）；实际排期是统一批次制，见下方说明
   "directories": { … },         // 入库目录设置，见 §5
   "quality": { … }              // 全局画质偏好档案，见步骤 7（pending 每条订阅另附合并后的 quality_profile，以那个为准）
 }
@@ -101,13 +101,22 @@ PanPilot 是一个影视订阅**控制面**（Cloudflare Workers + D1）。用�
   工作，不要因此中断整轮。
 - Cookie 只许放在内存里用；不要落盘明文缓存。非要缓存，用你运行环境的
   密钥存储并限制权限。
+- **调度是统一批次制**（v1.2）：所有订阅的 `next_check_at` 都对齐到
+  北京时间每天 **00:00 / 06:00 / 12:00 / 18:00** 四个批次点。一条订阅
+  处理完成后，服务端把它的下次检查排到「不早于处理时刻 +
+  `check_interval_hours`（默认 6）的第一个批次点」，实际间隔落在
+  6–12 小时。`check_interval_hours` 字段保留，语义就是这个最小间隔。
+  你只需要在批次点（或任意时刻）调 pending，返回的到期订阅即是整批
+  待处理集合；新建订阅立即可执行，首次处理后才进入批次节奏。
 
 ## 4. 标准一轮（十步）
 
 ### 步骤 1 拉订阅
 
 `GET /api/driver/pending?limit=20`。返回的是到期（`next_check_at` 已到）、
-未集齐/未完结/未暂停、且没有被其他 Driver 租约占用的订阅。
+未集齐/未完结/未暂停、且没有被其他 Driver 租约占用的订阅。控制面是
+统一批次调度（见 §3）：`next_check_at` 已对齐批次点，所以一次 pending
+拉到的就是这一批要整批处理的订阅。
 
 ### 步骤 2 认领（claim）
 
@@ -284,7 +293,9 @@ pending 给的 `missing_episodes`——用户可能在夸克 App 里手动增删
    `{season, episode, status: "stored", source_share_code, source_channel,
    quark_fid, file_name, file_size}`。
 4. 订阅状态：仍有缺集 → `subscription_status: "partial_stored"`（服务端会
-   自动排下一轮 `next_check_at = +check_interval_hours`）；全部集齐 →
+   自动排下一轮 `next_check_at`：统一批次制，对齐到不早于处理时刻 +
+   `check_interval_hours` 的第一个批次点，批次点为北京时间每天
+   00:00 / 06:00 / 12:00 / 18:00，见 §3）；全部集齐 →
    `"completed"`；**回写前再用 TMDB Key 查一次该剧的 TMDB 状态**，
    若已 **Ended/Canceled 且本季集数已齐全**，用 `"ended"` 代替
    `"completed"`，让订阅进入终态关闭、不再被下一轮重复拉起。
@@ -598,9 +609,10 @@ pending 给的 `missing_episodes`——用户可能在夸克 App 里手动增删
 2. 只在 `directories.base_dir` 这棵库目录树内建夹与转存；**不删除、
    不移动用户已有的任何文件**。盘点发现重复集时跳过，不要替用户删。
 3. manual 模式订阅：用户在网页确认前**绝不转存**。
-4. 频率克制：订阅串行处理；搜索对同一频道限速；两轮之间至少间隔
-   `check_interval_hours`（由控制面的 next_check_at 控制，你只处理
-   pending 返回的，不要自己提前捞未到期的订阅）。
+4. 频率克制：订阅串行处理；搜索对同一频道限速；排期由控制面统一
+   批次制管理（`next_check_at` 对齐北京时间 00/06/12/18 批次点，且不
+   早于上一轮处理时刻 + `check_interval_hours`），你只处理 pending
+   返回的到期订阅，不要自己提前捞未到期的订阅。
 5. 只转存用户订阅里缺失的集；不整包转多版本合集；异常大小的文件不入库。
 6. 本系统仅用于用户管理自己网盘内的内容；遵守夸克与 Telegram 的平台
    条款，遇到验证码/风控挑战立即停手并通知用户，不要尝试绕过。

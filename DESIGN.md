@@ -415,8 +415,14 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
    `github.com/ttainet/panpilot`）；网页端用**简单的账号密码登录**
    （`APP_USERNAME` / `APP_PASSWORD` Secrets + HMAC 签名会话 Cookie），不用 Cloudflare Access。
 2. ~~Driver v1 唤醒频率~~ **已定**：**每 6 小时一轮**（`CHECK_INTERVAL_HOURS=6`；
-   订阅新建时立即到期，Driver 回写 `partial_stored` 时自动排定 `next_check_at = +6h`，
-   pending 只返回到期且未集齐、未被租约占用的订阅）。通知渠道仍待定。
+   订阅新建时立即到期，Driver 回写 `partial_stored` 时自动排定下一轮
+   `next_check_at`，pending 只返回到期且未集齐、未被租约占用的订阅）。
+   通知渠道仍待定。
+   **v1.2 改为统一批次制**（用户拍板）：批次点为北京时间每天
+   00:00 / 06:00 / 12:00 / 18:00，处理完成后的 `next_check_at` 对齐到
+   不早于「处理时刻 + `CHECK_INTERVAL_HOURS`」的第一个批次点（实际间隔
+   6–12 小时），全部排期统一走服务端 helper `nextBatchCheckAt()`；
+   新建订阅仍立即到期、首次处理后进入批次节奏，已终结订阅不参与。
 3. ~~TMDB API Key 提供方式~~ **已定**：参考 MoviePilot 机制 —— TMDB API Key 在
    **PanPilot 设置页配置并保存**（存 settings 表，页面只显示末 4 位掩码，可更新/清除）；
    订阅流程为先 TMDB 搜索选剧、点选后回填元数据，**订阅绑定 TMDB ID 而非只存名字，后续按季订阅**；

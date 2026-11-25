@@ -111,6 +111,18 @@
  * filters, newest first, subscription titles joined); the Driver log
  * endpoint validates levels (info | warn | error, default info) and
  * migration 0005 adds the logs indexes the pagination relies on.
+ *
+ * v1.2: unified batch scheduling. A subscription's next_check_at used
+ * to be "its own last-processed time + check interval", which staggered
+ * every subscription onto its own clock. Now all scheduling goes
+ * through nextBatchCheckAt(): batch points are 00:00 / 06:00 / 12:00 /
+ * 18:00 Beijing time (fixed UTC+8 offset math, no local-timezone
+ * reliance), and a processed subscription's next check is the first
+ * batch point not earlier than (processed time + check interval), so
+ * the effective interval lands between 6h and 12h at the default 6h
+ * minimum. New subscriptions are still due immediately and only join
+ * the batch rhythm after their first processing; finished
+ * (ended/completed) subscriptions are untouched.
  */
 
 import {
@@ -174,7 +186,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -318,6 +330,30 @@ const uid = () => crypto.randomUUID();
 function checkIntervalSeconds(env: Env): number {
   const h = Number(env.CHECK_INTERVAL_HOURS ?? "6");
   return (Number.isFinite(h) && h > 0 ? h : 6) * 3600;
+}
+
+/**
+ * v1.2 unified batch scheduling: batch points are 00:00 / 06:00 / 12:00 /
+ * 18:00 Beijing time. Computed with a fixed UTC+8 offset — Workers code
+ * must never rely on the runtime's local timezone. Returns the first
+ * batch point that is not earlier than (fromSec + minIntervalSec), so
+ * with the default 6h minimum the effective interval lands in [6h, 12h].
+ */
+const BATCH_OFFSET_SEC = 8 * 3600; // Beijing = UTC+8, fixed offset
+const BATCH_STEP_SEC = 6 * 3600; // four batch points per day
+
+function nextBatchCheckAt(fromSec: number, minIntervalSec: number): number {
+  const target = fromSec + Math.max(0, minIntervalSec);
+  // Shift into "Beijing wall-clock" epoch space, where batch points are
+  // the day start plus k * BATCH_STEP_SEC (k = 0..3, plus next-day 00:00).
+  const local = target + BATCH_OFFSET_SEC;
+  const dayStart = Math.floor(local / 86400) * 86400;
+  for (let k = 0; k <= 4; k++) {
+    const pointLocal = dayStart + k * BATCH_STEP_SEC;
+    if (pointLocal >= local) return pointLocal - BATCH_OFFSET_SEC;
+  }
+  // Unreachable: k = 4 is the next day's 00:00, always >= local.
+  return dayStart + 86400 - BATCH_OFFSET_SEC;
 }
 
 function json(data: unknown, status = 200): Response {
@@ -1422,8 +1458,10 @@ async function handleDriverProgress(req: Request, store: Store, env: Env, ctx?: 
   if (input.next_check_at) {
     patch.next_check_at = input.next_check_at;
   } else if (input.subscription_status === "partial_stored") {
-    // Still following this show: schedule the next Driver round (+6h by default).
-    patch.next_check_at = now() + checkIntervalSeconds(env);
+    // Still following this show: schedule the next check on the unified
+    // batch rhythm (v1.2) — the first Beijing 00/06/12/18 batch point
+    // that is at least the check interval (default 6h) from now.
+    patch.next_check_at = nextBatchCheckAt(now(), checkIntervalSeconds(env));
   }
   if (input.note) patch.last_error = input.note;
   if (Object.keys(patch).length) await store.updateSubscription(task.subscription_id, patch);

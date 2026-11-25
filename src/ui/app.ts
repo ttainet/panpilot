@@ -580,7 +580,7 @@ export function appHtml(initialView: string): string {
             <div class="card-head">
               <h2>Driver 调度参数</h2>
             </div>
-            <p class="section-desc" style="margin-bottom:0">Driver 默认检查间隔为 <strong id="interval">…</strong> 小时一轮（由 Worker 环境变量 <code>CHECK_INTERVAL_HOURS</code> 控制）。Driver API Key 与网页端登录会话完全隔离。</p>
+            <p class="section-desc" style="margin-bottom:0">Driver 按统一批次处理到期订阅：每天北京时间 <strong>00:00 / 06:00 / 12:00 / 18:00</strong> 四个批次。订阅处理完成后，下次检查对齐到不早于处理时刻 +<strong id="interval">…</strong> 小时的第一个批次点（实际间隔 6–12 小时；最小间隔由 Worker 环境变量 <code>CHECK_INTERVAL_HOURS</code> 控制）。新建订阅立即可执行，首次处理后进入批次节奏。Driver API Key 与网页端登录会话完全隔离。</p>
           </div>
         </div>
 
