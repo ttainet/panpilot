@@ -82,6 +82,16 @@
  * merge themselves. The guide's candidate selection becomes two-stage:
  * hard filters from the profile, then scoring (already-stored season
  * spec still outranks the profile — no mixing within a season).
+ *
+ * v1.0.1: guide-only update — five field rules from the second real
+ * Driver run （现在就出发 S4) folded into docs/AI_DRIVER_GUIDE.md and
+ * AGENTS.md: unaired episodes are not this round's missing set; variety
+ * episode mapping follows TMDB's season structure, not literal 期号；
+ * variety derivatives （先导/加更/纯享/会员版/特辑） join the
+ * do-not-transfer list; shares already logged candidate_dead are
+ * skipped without re-opening; single-source whole-season coverage is
+ * preferred and a size anomaly disqualifies only that episode, not
+ * the whole source. No functional changes.
  */
 
 import {
@@ -127,7 +137,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 

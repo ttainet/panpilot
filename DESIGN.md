@@ -1,6 +1,6 @@
-# PanPilot 设计稿 v1.0
+# PanPilot 设计稿 v1.0.1
 
-> 状态：v1.0。本文档描述目标架构与接口契约；部署方式见 README 的部署章节
+> 状态：v1.0.1。本文档描述目标架构与接口契约；部署方式见 README 的部署章节
 > （部署到你自己的 Cloudflare 账号与域名）。
 >
 > v1.0 变更：画质偏好系统。全局档案存 settings 键 `quality`（src/quality.ts：
