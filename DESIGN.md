@@ -1,7 +1,12 @@
-# PanPilot 设计稿 v1.0.2
+# PanPilot 设计稿 v1.1.0
 
-> 状态：v1.0.2。本文档描述目标架构与接口契约；部署方式见 README 的部署章节
+> 状态：v1.1.0。本文档描述目标架构与接口契约；部署方式见 README 的部署章节
 > （部署到你自己的 Cloudflare 账号与域名）。
+>
+> v1.1 变更：订阅页分组（已完成 = completed | ended，其余为订阅中，仪表盘
+> 口径与之统一）；新增网页日志接口 `GET /api/logs`（级别/订阅筛选、时间
+> 倒序分页）与「日志」页；Driver 日志提交端点校验级别
+> （info | warn | error，缺省 info）；迁移 0005 为 logs 表补分页索引。
 >
 > v1.0 变更：画质偏好系统。全局档案存 settings 键 `quality`（src/quality.ts：
 > preferred_resolution / allow_fallback / exclude_remux / exclude_cam /

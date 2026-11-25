@@ -1,8 +1,9 @@
 # PanPilot
 
-> Status: v1.0.2. Deploy it to your own Cloudflare account and your own domain —
+> Status: v1.1.0. Deploy it to your own Cloudflare account and your own domain —
 > see [Deployment](#部署--deployment) below. Design: [DESIGN.md](./DESIGN.md).
-> 状态：v1.0.2。部署到你自己的 Cloudflare 账号与域名，步骤见下方[部署](#部署--deployment)。设计见 [DESIGN.md](./DESIGN.md)。
+> 状态：v1.1.0。部署到你自己的 Cloudflare 账号与域名，步骤见下方[部署](#部署--deployment)。设计见 [DESIGN.md](./DESIGN.md)。
+> v1.1 变更：「我的订阅」按订阅中 / 已完成分组（带数量、搜索只过滤当前组），卡片布局优化；新增「日志」页展示 Driver 操作日志，支持按级别（info/warn/error）与订阅筛选、分页加载。
 > v1.0.2 变更：AI Driver 手册补入第三轮实战的两条规则（同季已混版时按多数规格补集、已有集不替换；播出未满 48 小时无源记为「待源」不报错），无功能变更。
 > v1.0.1 变更：AI Driver 手册补入第二轮实战的五条规则（未播出不算缺集、综艺集号以 TMDB 结构为准、综艺衍生内容不转、失效分享不重复打开、单源整季优先且大小异常只淘汰单集），无功能变更。
 > v1.0 变更：画质偏好系统——设置页新增「画质偏好」Tab 维护全局档案（首选清晰度、

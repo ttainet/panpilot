@@ -100,6 +100,17 @@
  * stored episodes are never replaced; episodes aired within 48h with
  * no source anywhere are marked 待源 (pending-source) — no error, no
  * candidate downgrade — and retried next round. No functional changes.
+ *
+ * v1.1: subscriptions page is split into 订阅中 / 已完成 groups
+ * (finished = completed | ended; everything else, including paused and
+ * error, stays in 订阅中), with per-group counts, group-scoped search,
+ * and tidier cards (two-line title clamp, progress percentage, green
+ * bar when complete). Dashboard "following" now counts exactly the
+ * 订阅中 group so the numbers agree. New 日志 page: GET /api/logs
+ * (web session) pages through the logs table (level / subscription
+ * filters, newest first, subscription titles joined); the Driver log
+ * endpoint validates levels (info | warn | error, default info) and
+ * migration 0005 adds the logs indexes the pagination relies on.
  */
 
 import {
@@ -145,7 +156,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "1.0.2";
+const VERSION = "1.1.0";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -248,6 +259,35 @@ export interface DriverKey {
 /** Stored form of a DriverKey: adds the SHA-256 hash of the token. */
 export interface DriverKeyRecord extends DriverKey {
   token_hash: string;
+}
+
+/** Log levels accepted from Drivers and used by the web log page (v1.1). */
+export const LOG_LEVELS = ["info", "warn", "error"] as const;
+export type LogLevel = (typeof LOG_LEVELS)[number];
+
+/** One row of the logs table, as returned by GET /api/logs (v1.1). */
+export interface LogEntry {
+  id: string;
+  subscription_id?: string | null;
+  /** Title of the subscription at read time (null when unlinked/deleted). */
+  subscription_title?: string | null;
+  driver_id?: string | null;
+  level: string;
+  event: string;
+  detail?: string | null;
+  created_at: number;
+  /** Monotonic insertion order (D1 rowid / memory sequence). Only used
+   *  to build pagination cursors; not displayed. */
+  seq?: number;
+}
+
+export interface ListLogsOptions {
+  level?: string;
+  subscriptionId?: string;
+  /** Keyset cursor: rows strictly older than (sec, seq). seq is null
+   *  for a plain epoch-second cursor (then only created_at < sec). */
+  before?: { sec: number; seq: number | null };
+  limit: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +654,8 @@ export interface Store {
   /** Stored-episode counts grouped by subscription and season (for stats / progress bars). */
   getStoredCounts(): Promise<{ subscription_id: string; season: number; count: number }[]>;
   addLog(entry: { subscription_id?: string; driver_id?: string; level: string; event: string; detail?: string }): Promise<void>;
+  /** Newest-first log page for the web 日志 page (v1.1). */
+  listLogs(opts: ListLogsOptions): Promise<LogEntry[]>;
   /** UI-managed Driver API keys (v0.6), newest first, hashes included only where noted. */
   listDriverKeys(): Promise<DriverKey[]>;
   getDriverKey(id: string): Promise<DriverKeyRecord | null>;
@@ -640,7 +682,8 @@ class MemoryStore implements Store {
   private tasks = new Map<string, DriverTask>();
   private candidates: (CandidateInput & { subscription_id: string })[] = [];
   private episodes = new Map<string, EpisodeRecord>();
-  private logs: unknown[] = [];
+  private logs: LogEntry[] = [];
+  private logSeq = 0;
   private settings = new Map<string, string>();
   private driverKeys = new Map<string, DriverKeyRecord>();
 
@@ -717,7 +760,35 @@ class MemoryStore implements Store {
     return [...out.values()];
   }
   async addLog(entry: { subscription_id?: string; driver_id?: string; level: string; event: string; detail?: string }) {
-    this.logs.push({ ...entry, created_at: now() });
+    this.logs.push({
+      id: uid(),
+      subscription_id: entry.subscription_id ?? null,
+      driver_id: entry.driver_id ?? null,
+      level: entry.level,
+      event: entry.event,
+      detail: entry.detail ?? null,
+      created_at: now(),
+      seq: ++this.logSeq,
+    });
+  }
+  async listLogs(opts: ListLogsOptions): Promise<LogEntry[]> {
+    return this.logs
+      .filter((l) => !opts.level || l.level === opts.level)
+      .filter((l) => !opts.subscriptionId || l.subscription_id === opts.subscriptionId)
+      .filter((l) => {
+        if (!opts.before) return true;
+        if (l.created_at < opts.before.sec) return true;
+        return opts.before.seq != null
+          && l.created_at === opts.before.sec
+          && (l.seq ?? 0) < opts.before.seq;
+      })
+      .slice()
+      .sort((a, b) => (b.created_at - a.created_at) || ((b.seq ?? 0) - (a.seq ?? 0)))
+      .slice(0, opts.limit)
+      .map((l) => ({
+        ...l,
+        subscription_title: l.subscription_id ? (this.subs.get(l.subscription_id)?.title ?? null) : null,
+      }));
   }
   async listDriverKeys(): Promise<DriverKey[]> {
     return [...this.driverKeys.values()]
@@ -1018,6 +1089,44 @@ class D1Store implements Store {
       .run();
   }
 
+  async listLogs(opts: ListLogsOptions): Promise<LogEntry[]> {
+    // Keyset pagination on (created_at, rowid): a plain epoch cursor
+    // (?4 = -1) keeps only created_at < ?3; a composite cursor also
+    // keeps same-second rows with a smaller rowid, so bursts of logs
+    // written within one second are never skipped between pages.
+    const res = await this.db
+      .prepare(
+        `SELECT l.id, l.subscription_id, l.driver_id, l.level, l.event, l.detail, l.created_at,
+                l.rowid AS seq, s.title AS subscription_title
+           FROM logs l
+           LEFT JOIN subscriptions s ON s.id = l.subscription_id
+          WHERE (?1 IS NULL OR l.level = ?1)
+            AND (?2 IS NULL OR l.subscription_id = ?2)
+            AND (?3 IS NULL OR l.created_at < ?3 OR (l.created_at = ?3 AND l.rowid < ?4))
+          ORDER BY l.created_at DESC, l.rowid DESC
+          LIMIT ?5`,
+      )
+      .bind(
+        opts.level ?? null,
+        opts.subscriptionId ?? null,
+        opts.before?.sec ?? null,
+        opts.before ? (opts.before.seq ?? -1) : 0,
+        opts.limit,
+      )
+      .all<Row>();
+    return res.results.map((r) => ({
+      id: String(r.id),
+      subscription_id: r.subscription_id == null ? null : String(r.subscription_id),
+      subscription_title: r.subscription_title == null ? null : String(r.subscription_title),
+      driver_id: r.driver_id == null ? null : String(r.driver_id),
+      level: String(r.level ?? "info"),
+      event: String(r.event),
+      detail: r.detail == null ? null : String(r.detail),
+      created_at: Number(r.created_at),
+      seq: Number(r.seq),
+    }));
+  }
+
   async listDriverKeys(): Promise<DriverKey[]> {
     const res = await this.db
       .prepare("SELECT id, name, token_hint, created_at, last_used_at, revoked_at FROM driver_keys ORDER BY created_at DESC")
@@ -1186,7 +1295,10 @@ async function handleStats(store: Store): Promise<Response> {
   return json({
     stats: {
       total_subscriptions: subs.length,
-      following: subs.filter((s) => ACTIVE_STATUSES.includes(s.status)).length,
+      // 订阅中 group (v1.1): everything not finished — the active
+      // statuses plus paused — so this always equals total - finished
+      // and matches the subscriptions page grouping.
+      following: subs.filter((s) => ACTIVE_STATUSES.includes(s.status) || s.status === "paused").length,
       finished: subs.filter((s) => FINISHED_STATUSES.includes(s.status)).length,
       paused: subs.filter((s) => s.status === "paused").length,
       stored_episodes: storedEpisodes,
@@ -1333,10 +1445,11 @@ async function handleDriverHeartbeat(req: Request, store: Store): Promise<Respon
 async function handleDriverLogs(req: Request, store: Store): Promise<Response> {
   const input = await body<{
     task_id?: string;
-    logs?: { level?: string; event?: string; detail?: string }[];
+    subscription_id?: string;
+    logs?: { level?: string; event?: string; detail?: string; subscription_id?: string }[];
   }>(req);
   if (!input || !Array.isArray(input.logs)) return err("bad_request", "logs[] is required", 400);
-  let subscriptionId: string | undefined;
+  let subscriptionId: string | undefined = input.subscription_id;
   let driverId: string | undefined;
   if (input.task_id) {
     const task = await store.getTask(input.task_id);
@@ -1347,13 +1460,53 @@ async function handleDriverLogs(req: Request, store: Store): Promise<Response> {
   let accepted = 0;
   for (const l of input.logs) {
     if (!l.event) continue;
+    // Levels are a fixed set (v1.1): anything else is stored as info so
+    // the web log page's level filter stays exhaustive.
+    const level = (LOG_LEVELS as readonly string[]).includes(l.level ?? "")
+      ? (l.level as string)
+      : "info";
     await store.addLog({
-      subscription_id: subscriptionId, driver_id: driverId,
-      level: l.level ?? "info", event: l.event, detail: l.detail,
+      subscription_id: l.subscription_id ?? subscriptionId, driver_id: driverId,
+      level, event: l.event, detail: l.detail,
     });
     accepted++;
   }
   return json({ accepted });
+}
+
+/**
+ * GET /api/logs — web log page feed (v1.1). Newest first; filters:
+ * level (info|warn|error), subscription_id; pagination via limit
+ * (default 50, max 200) and before. The cursor is opaque: either a
+ * plain epoch second (only rows with created_at < before) or the
+ * composite "<created_at>:<seq>" returned as next_before, which also
+ * disambiguates same-second rows so paged bursts lose nothing.
+ * Fetches one extra row to report has_more.
+ */
+async function handleListLogs(url: URL, store: Store): Promise<Response> {
+  const levelParam = url.searchParams.get("level");
+  const level = levelParam && (LOG_LEVELS as readonly string[]).includes(levelParam)
+    ? levelParam
+    : undefined;
+  const subscriptionId = url.searchParams.get("subscription_id") || undefined;
+  const limitRaw = Number(url.searchParams.get("limit") ?? 50);
+  const limit = Number.isFinite(limitRaw) ? Math.min(200, Math.max(1, Math.floor(limitRaw))) : 50;
+  let before: ListLogsOptions["before"];
+  const beforeRaw = url.searchParams.get("before") ?? "";
+  const m = beforeRaw.match(/^(\d+)(?::(\d+))?$/);
+  if (m) {
+    before = { sec: Number(m[1]), seq: m[2] != null ? Number(m[2]) : null };
+    if (!(before.sec > 0)) before = undefined;
+  }
+  const rows = await store.listLogs({ level, subscriptionId, before, limit: limit + 1 });
+  const hasMore = rows.length > limit;
+  const logs = hasMore ? rows.slice(0, limit) : rows;
+  const last = logs[logs.length - 1];
+  return json({
+    logs,
+    has_more: hasMore,
+    next_before: hasMore && last ? `${last.created_at}:${last.seq ?? 0}` : null,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2189,21 +2342,24 @@ const APP_CSS = `
   form.inline { display: flex; flex-wrap: wrap; gap: .55rem; align-items: center; margin-top: .7rem; }
 
   /* ---- subscription poster wall ---- */
-  .sub-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; }
+  .sub-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1rem; align-items: stretch; }
   .sub-card {
-    display: flex; gap: .95rem;
+    display: flex; gap: .95rem; height: 100%;
     background: var(--pp-panel); border: 1px solid var(--pp-border);
     border-radius: var(--pp-radius); box-shadow: var(--pp-shadow);
     padding: .9rem;
   }
-  .poster { width: 92px; height: 138px; object-fit: cover; border-radius: 9px; flex: 0 0 auto; background: var(--pp-panel-2); }
+  .poster { width: 92px; height: 138px; aspect-ratio: 2 / 3; object-fit: cover; border-radius: 9px; flex: 0 0 auto; background: var(--pp-panel-2); }
   .poster-ph {
     display: flex; align-items: center; justify-content: center;
     font-size: 2rem; font-weight: 700; color: var(--pp-muted);
     background: linear-gradient(160deg, var(--pp-panel-2), var(--pp-bg-soft));
   }
   .sub-body { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; }
-  .sub-title { font-weight: 650; font-size: 1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub-title {
+    font-weight: 650; font-size: 1rem; line-height: 1.35; min-height: 2.7em;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
   .sub-year { color: var(--pp-muted); font-weight: 500; font-size: .88rem; }
   .tag-row { display: flex; flex-wrap: wrap; gap: .35rem; margin: .45rem 0 .55rem; }
   .tag {
@@ -2223,6 +2379,57 @@ const APP_CSS = `
   .b-done { background: rgba(52, 201, 142, .15); color: var(--pp-green); }
   .b-paused { background: rgba(138, 147, 168, .16); color: var(--pp-gray); }
   .b-error { background: rgba(242, 109, 109, .15); color: var(--pp-red); }
+  .progress-bar-done { background: var(--pp-green); }
+
+  /* ---- subscriptions grouping toolbar (v1.1) ---- */
+  .sub-toolbar {
+    display: flex; flex-wrap: wrap; gap: .7rem; align-items: center;
+    margin-bottom: 1.1rem;
+  }
+  .seg {
+    display: inline-flex; gap: .25rem;
+    background: var(--pp-bg-soft); border: 1px solid var(--pp-border);
+    border-radius: 999px; padding: .25rem;
+  }
+  .seg-btn {
+    border: none; background: transparent; cursor: pointer;
+    color: var(--pp-muted); font-size: .92rem; white-space: nowrap;
+    padding: .42rem .95rem; border-radius: 999px;
+  }
+  .seg-btn:hover { color: var(--pp-text); }
+  .seg-btn.active { background: var(--pp-panel-2); color: #fff; font-weight: 600; box-shadow: var(--pp-shadow); }
+  .seg-btn .seg-count { opacity: .75; font-weight: 500; }
+  .sub-search { flex: 1 1 200px; max-width: 340px; margin-left: auto; }
+  .sub-empty {
+    border: 1px dashed var(--pp-border); border-radius: var(--pp-radius);
+    padding: 2.2rem 1.4rem; text-align: center; color: var(--pp-muted);
+    font-size: .92rem; line-height: 1.6;
+  }
+
+  /* ---- logs page (v1.1) ---- */
+  .logs-toolbar { display: flex; flex-wrap: wrap; gap: .7rem; align-items: center; margin-bottom: .6rem; }
+  .logs-toolbar select { max-width: 260px; }
+  .logs-toolbar .btn { margin-left: auto; }
+  .log-row {
+    display: flex; gap: .8rem; align-items: flex-start;
+    padding: .6rem 0; border-bottom: 1px solid var(--pp-border);
+  }
+  .log-row:last-child { border-bottom: none; }
+  .log-time { flex: 0 0 9.2rem; color: var(--pp-muted); font-size: .8rem; padding-top: .18rem; white-space: nowrap; }
+  .log-badge { flex: 0 0 auto; margin-top: .1rem; }
+  .log-main { flex: 1 1 auto; min-width: 0; }
+  .log-sub { font-size: .82rem; color: var(--pp-muted); margin-bottom: .12rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .log-msg {
+    font-size: .9rem; line-height: 1.5; word-break: break-word; cursor: pointer;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .log-msg.expanded { display: block; overflow: visible; }
+  .log-detail { color: var(--pp-muted); font-size: .83rem; }
+  .log-more-wrap { text-align: center; margin-top: 1rem; }
+  @media (max-width: 880px) {
+    .log-time { flex-basis: 7.6rem; }
+    .sub-search { margin-left: 0; max-width: none; }
+  }
 
   /* ---- recent list (dashboard) ---- */
   .recent-row {
@@ -2374,6 +2581,7 @@ const ICON_DASH = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" s
 const ICON_SUBS = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 4v5"/></svg>';
 const ICON_FIND = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M15.5 8.5l-2 5-5 2 2-5z"/></svg>';
 const ICON_GEAR = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v3M12 18.2v3M2.8 12h3M18.2 12h3M5.5 5.5l2.1 2.1M16.4 16.4l2.1 2.1M18.5 5.5l-2.1 2.1M7.6 16.4l-2.1 2.1"/></svg>';
+const ICON_LOG = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 2.8h9L19 6.8V21a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V3.8A1 1 0 0 1 6 2.8z"/><path d="M14.5 2.8V7H19M8.5 12h7M8.5 16h7"/></svg>';
 
 function appHtml(initialView: string): string {
   return `<!DOCTYPE html>
@@ -2398,6 +2606,7 @@ function appHtml(initialView: string): string {
       <button class="menu-item" data-nav="dashboard">${ICON_DASH}<span>仪表盘</span></button>
       <button class="menu-item" data-nav="subscriptions">${ICON_SUBS}<span>我的订阅</span></button>
       <button class="menu-item" data-nav="discover">${ICON_FIND}<span>发现</span></button>
+      <button class="menu-item" data-nav="logs">${ICON_LOG}<span>日志</span></button>
       <button class="menu-item" data-nav="settings">${ICON_GEAR}<span>设置</span></button>
     </nav>
     <div class="sidebar-foot">
@@ -2415,7 +2624,7 @@ function appHtml(initialView: string): string {
       <section class="view" id="view-dashboard">
         <div class="stat-grid">
           <div class="stat-card"><div class="stat-label">订阅总数</div><div class="stat-value" id="stat-total">–</div></div>
-          <div class="stat-card"><div class="stat-label">追更中</div><div class="stat-value" id="stat-following">–</div></div>
+          <div class="stat-card"><div class="stat-label">订阅中</div><div class="stat-value" id="stat-following">–</div></div>
           <div class="stat-card"><div class="stat-label">已完结 / 集齐</div><div class="stat-value" id="stat-finished">–</div></div>
           <div class="stat-card"><div class="stat-label">已入库集数</div><div class="stat-value" id="stat-stored">–</div></div>
         </div>
@@ -2427,7 +2636,36 @@ function appHtml(initialView: string): string {
       </section>
 
       <section class="view" id="view-subscriptions">
+        <div class="sub-toolbar">
+          <div class="seg" role="tablist" aria-label="订阅分组">
+            <button class="seg-btn active" data-group="active" role="tab">订阅中 <span class="seg-count" id="sub-count-active">0</span></button>
+            <button class="seg-btn" data-group="finished" role="tab">已完成 <span class="seg-count" id="sub-count-finished">0</span></button>
+          </div>
+          <input class="sub-search" id="sub-search" type="search" placeholder="搜索当前分组的订阅…">
+        </div>
         <div class="sub-grid" id="sub-grid"><p class="muted">加载中…</p></div>
+        <div class="sub-empty" id="sub-empty" hidden></div>
+      </section>
+
+      <section class="view" id="view-logs">
+        <div class="card">
+          <h2>Driver 操作日志</h2>
+          <p class="muted">Driver 每轮的认领、盘点、选源、转存与异常都汇总在这里，按时间倒序。点任意一条消息可展开全文。</p>
+          <div class="logs-toolbar">
+            <div class="seg" role="tablist" aria-label="日志级别">
+              <button class="seg-btn active" data-loglevel="">全部</button>
+              <button class="seg-btn" data-loglevel="info">info</button>
+              <button class="seg-btn" data-loglevel="warn">warn</button>
+              <button class="seg-btn" data-loglevel="error">error</button>
+            </div>
+            <select id="log-sub-filter" aria-label="按订阅筛选">
+              <option value="">全部订阅</option>
+            </select>
+            <button class="btn" id="log-refresh" type="button">刷新</button>
+          </div>
+          <div id="log-list"><p class="muted">加载中…</p></div>
+          <div class="log-more-wrap"><button class="btn" id="log-more" type="button" hidden>加载更多</button></div>
+        </div>
       </section>
 
       <section class="view" id="view-discover">
@@ -2645,8 +2883,10 @@ function appHtml(initialView: string): string {
 </div>
 
 <script>
-var VIEWS = ['dashboard', 'subscriptions', 'discover', 'settings'];
-var VIEW_TITLES = { dashboard: '仪表盘', subscriptions: '我的订阅', discover: '发现', settings: '设置' };
+var VIEWS = ['dashboard', 'subscriptions', 'discover', 'logs', 'settings'];
+var VIEW_TITLES = { dashboard: '仪表盘', subscriptions: '我的订阅', discover: '发现', logs: '日志', settings: '设置' };
+var FINISHED_STATUSES = ['completed', 'ended'];
+function isFinishedSub(s) { return FINISHED_STATUSES.indexOf(s.status) >= 0; }
 var STATUS_LABEL = {
   subscribed: '已订阅', pending_search: '待搜索', searching: '搜索中',
   candidates_ready: '已找到候选', awaiting_confirm: '待确认', transferring: '转存中',
@@ -2698,8 +2938,11 @@ function switchView(name) {
     items[j].classList.toggle('active', items[j].getAttribute('data-nav') === name);
   }
   document.getElementById('page-title').textContent = VIEW_TITLES[name];
-  if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
+  var wantHash = '#' + name;
+  if (name === 'subscriptions' && subGroup === 'finished') wantHash = '#subscriptions-finished';
+  if (location.hash !== wantHash) history.replaceState(null, '', wantHash);
   if (name === 'settings') switchSettingsTab(currentSettingsTab);
+  if (name === 'logs') loadLogs(true);
 }
 var navItems = document.querySelectorAll('.menu-item');
 for (var n = 0; n < navItems.length; n++) {
@@ -2761,21 +3004,84 @@ function subCard(s) {
           + (r === '2160p' ? '优先 4K' : '优先 ' + r) + '</option>';
       }).join('')
     + '</select>';
+  var done = isFinishedSub(s);
+  var timeLine = done
+    ? '完成于 ' + fmtTime(s.updated_at)
+    : '下次检查：' + fmtTime(s.next_check_at);
   return '<article class="sub-card">' + posterHtml(s, 'poster')
     + '<div class="sub-body">'
     + '<div class="sub-title">' + esc(s.title) + (s.year ? ' <span class="sub-year">' + s.year + '</span>' : '') + '</div>'
     + '<div class="tag-row">' + tags + '</div>'
-    + '<div class="progress"><div class="progress-bar" style="width:' + p.pct + '%"></div></div>'
-    + '<div class="sub-meta"><span>' + p.text + '</span>' + badge(s.status) + '</div>'
-    + '<div class="sub-next">下次检查：' + fmtTime(s.next_check_at) + '</div>'
+    + '<div class="progress"><div class="progress-bar' + (done || p.pct >= 100 ? ' progress-bar-done' : '') + '" style="width:' + p.pct + '%"></div></div>'
+    + '<div class="sub-meta"><span>' + p.text + ' · ' + p.pct + '%</span>' + badge(s.status) + '</div>'
+    + '<div class="sub-next">' + timeLine + '</div>'
     + '<div class="sub-actions">' + pauseBtn + qualityEdit
     + '<button class="btn btn-danger" data-act="delete" data-id="' + s.id + '">删除</button></div>'
     + '</div></article>';
 }
-function renderSubs() {
-  var grid = document.getElementById('sub-grid');
-  grid.innerHTML = subsCache.length ? subsCache.map(subCard).join('') : '<p class="muted">暂无订阅，去「发现」页搜一部剧开始吧。</p>';
+/* ---------- subscriptions grouping (v1.1) ----------
+ * Two groups: 订阅中 (everything not finished) and 已完成
+ * (completed | ended). The search box filters only the current group.
+ * The active group lives in subGroup and is mirrored into the URL
+ * hash (#subscriptions / #subscriptions-finished) so a refresh keeps
+ * the user in the same group. */
+var subGroup = 'active';
+var subSearchText = '';
+function subsInGroup(group) {
+  return subsCache.filter(function (s) { return group === 'finished' ? isFinishedSub(s) : !isFinishedSub(s); });
 }
+function switchSubGroup(group, updateHash) {
+  subGroup = group === 'finished' ? 'finished' : 'active';
+  var btns = document.querySelectorAll('[data-group]');
+  for (var i = 0; i < btns.length; i++) {
+    btns[i].classList.toggle('active', btns[i].getAttribute('data-group') === subGroup);
+  }
+  renderSubs();
+  if (updateHash !== false) {
+    var want = subGroup === 'finished' ? '#subscriptions-finished' : '#subscriptions';
+    if (location.hash !== want) history.replaceState(null, '', want);
+  }
+}
+function renderSubs() {
+  var active = subsInGroup('active');
+  var finished = subsInGroup('finished');
+  document.getElementById('sub-count-active').textContent = active.length;
+  document.getElementById('sub-count-finished').textContent = finished.length;
+  var q = subSearchText.trim().toLowerCase();
+  var list = subsInGroup(subGroup).filter(function (s) {
+    if (!q) return true;
+    return (s.title || '').toLowerCase().indexOf(q) >= 0
+      || (s.original_title || '').toLowerCase().indexOf(q) >= 0;
+  });
+  var grid = document.getElementById('sub-grid');
+  var empty = document.getElementById('sub-empty');
+  if (list.length) {
+    grid.style.display = '';
+    empty.hidden = true;
+    grid.innerHTML = list.map(subCard).join('');
+    return;
+  }
+  grid.style.display = 'none';
+  grid.innerHTML = '';
+  empty.hidden = false;
+  if (q) {
+    empty.textContent = '当前分组里没有匹配「' + subSearchText.trim() + '」的订阅。';
+  } else if (subGroup === 'finished') {
+    empty.textContent = '还没有已完成的订阅。剧集齐或完结的订阅会自动归到这里。';
+  } else if (!subsCache.length) {
+    empty.textContent = '暂无订阅，去「发现」页搜一部剧开始吧。';
+  } else {
+    empty.textContent = '订阅中的都处理完了，去「已完成」里看看，或者去「发现」页加一部新剧。';
+  }
+}
+var groupBtns = document.querySelectorAll('[data-group]');
+for (var gi = 0; gi < groupBtns.length; gi++) {
+  groupBtns[gi].addEventListener('click', function () { switchSubGroup(this.getAttribute('data-group')); });
+}
+document.getElementById('sub-search').addEventListener('input', function () {
+  subSearchText = this.value;
+  renderSubs();
+});
 function renderDashboard(stats) {
   document.getElementById('stat-total').textContent = stats.total_subscriptions;
   document.getElementById('stat-following').textContent = stats.following;
@@ -2803,7 +3109,88 @@ async function loadSubs() {
   storedMap = (sd.stats && sd.stats.stored_by_subscription) || {};
   renderSubs();
   renderDashboard(sd.stats);
+  renderLogSubFilter();
 }
+
+/* ---------- logs page (v1.1) ---------- */
+var logLevel = '';
+var logSubId = '';
+var logNextBefore = null;
+var logLoading = false;
+function logBadgeHtml(level) {
+  var lv = level === 'warn' || level === 'error' ? level : 'info';
+  var cls = lv === 'error' ? 'b-error' : (lv === 'warn' ? 'b-partial' : 'b-active');
+  return '<span class="badge ' + cls + ' log-badge">' + lv + '</span>';
+}
+function logRowHtml(l) {
+  var subLine = l.subscription_title ? esc(l.subscription_title) : '系统';
+  if (l.driver_id) subLine += ' · ' + esc(l.driver_id);
+  var msg = esc(l.event || '');
+  if (l.detail) msg += ' <span class="log-detail">' + esc(l.detail) + '</span>';
+  return '<div class="log-row"><div class="log-time">' + fmtTime(l.created_at) + '</div>'
+    + logBadgeHtml(l.level)
+    + '<div class="log-main"><div class="log-sub">' + subLine + '</div>'
+    + '<div class="log-msg" title="点击展开 / 收起">' + msg + '</div></div></div>';
+}
+async function loadLogs(reset) {
+  if (logLoading) return;
+  logLoading = true;
+  var list = document.getElementById('log-list');
+  var moreBtn = document.getElementById('log-more');
+  try {
+    if (reset) { logNextBefore = null; list.innerHTML = '<p class="muted">加载中…</p>'; moreBtn.hidden = true; }
+    var qs = '?limit=50';
+    if (logLevel) qs += '&level=' + encodeURIComponent(logLevel);
+    if (logSubId) qs += '&subscription_id=' + encodeURIComponent(logSubId);
+    if (!reset && logNextBefore) qs += '&before=' + encodeURIComponent(logNextBefore);
+    var r = await api('/api/logs' + qs);
+    var data = await r.json();
+    var rows = data.logs || [];
+    if (reset) {
+      list.innerHTML = rows.length
+        ? rows.map(logRowHtml).join('')
+        : '<p class="muted">暂无符合条件的日志。Driver 跑过一轮后，这里会出现它的操作记录。</p>';
+    } else if (rows.length) {
+      list.insertAdjacentHTML('beforeend', rows.map(logRowHtml).join(''));
+    }
+    logNextBefore = data.next_before;
+    moreBtn.hidden = !data.has_more;
+  } catch (e) {
+    if (reset) list.innerHTML = '<p class="error-text">日志加载失败，点「刷新」重试。</p>';
+  }
+  logLoading = false;
+}
+function renderLogSubFilter() {
+  var sel = document.getElementById('log-sub-filter');
+  if (!sel) return;
+  var cur = sel.value;
+  var html = '<option value="">全部订阅</option>';
+  for (var i = 0; i < subsCache.length; i++) {
+    html += '<option value="' + subsCache[i].id + '"' + (subsCache[i].id === cur ? ' selected' : '') + '>'
+      + esc(subsCache[i].title) + '</option>';
+  }
+  sel.innerHTML = html;
+}
+var logLvlBtns = document.querySelectorAll('[data-loglevel]');
+for (var li = 0; li < logLvlBtns.length; li++) {
+  logLvlBtns[li].addEventListener('click', function () {
+    logLevel = this.getAttribute('data-loglevel') || '';
+    for (var j = 0; j < logLvlBtns.length; j++) {
+      logLvlBtns[j].classList.toggle('active', logLvlBtns[j] === this);
+    }
+    loadLogs(true);
+  });
+}
+document.getElementById('log-sub-filter').addEventListener('change', function () {
+  logSubId = this.value;
+  loadLogs(true);
+});
+document.getElementById('log-refresh').addEventListener('click', function () { loadLogs(true); });
+document.getElementById('log-more').addEventListener('click', function () { loadLogs(false); });
+document.getElementById('log-list').addEventListener('click', function (e) {
+  var m = e.target.closest('.log-msg');
+  if (m) m.classList.toggle('expanded');
+});
 document.getElementById('sub-grid').addEventListener('click', async function (e) {
   var btn = e.target.closest('button[data-act]');
   if (!btn) return;
@@ -3407,10 +3794,12 @@ document.getElementById('channels-reset').addEventListener('click', async functi
 var initial = document.body.getAttribute('data-initial-view') || 'dashboard';
 if (location.hash) {
   var h = location.hash.slice(1);
-  if (VIEWS.indexOf(h) >= 0) initial = h;
+  if (h === 'subscriptions-finished') { initial = 'subscriptions'; subGroup = 'finished'; }
+  else if (VIEWS.indexOf(h) >= 0) initial = h;
   else if (SETTINGS_TABS.indexOf(h) >= 0) { initial = 'settings'; currentSettingsTab = h; }
 }
 switchView(initial);
+switchSubGroup(subGroup, false);
 loadSettings();
 loadSubs();
 </script>
@@ -3474,6 +3863,9 @@ export default {
       if (pathname === "/discover") {
         return new Response(appHtml("discover"), { headers: { "content-type": "text/html; charset=utf-8" } });
       }
+      if (pathname === "/logs") {
+        return new Response(appHtml("logs"), { headers: { "content-type": "text/html; charset=utf-8" } });
+      }
       if (pathname === "/settings") {
         return new Response(appHtml("settings"), { headers: { "content-type": "text/html; charset=utf-8" } });
       }
@@ -3492,6 +3884,8 @@ export default {
       }
 
       if (pathname === "/api/stats" && req.method === "GET") return handleStats(store);
+
+      if (pathname === "/api/logs" && req.method === "GET") return handleListLogs(url, store);
 
       if (pathname === "/api/settings/driver-keys" || pathname.startsWith("/api/settings/driver-keys/")) {
         if (pathname === "/api/settings/driver-keys") {

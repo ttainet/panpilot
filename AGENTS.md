@@ -51,8 +51,10 @@
    share/save 到目标 Season 夹 → task 轮询），只转缺集。
 9. 按 `directories` 模板重命名，再列目录复核，然后
    `POST /api/driver/progress` 逐集回写 stored + 订阅状态。
-10. 长任务穿插 `POST /api/driver/heartbeat` 续租；结束用
-    `POST /api/driver/logs` 汇总（只写事件与数字）。
+10. 长任务穿插 `POST /api/driver/heartbeat` 续租；关键节点（认领、
+    盘点、选源、转存、异常）都用 `POST /api/driver/logs` 提交日志
+    （只写事件与数字；级别 info 正常 / warn 异常可继续 / error 致命，
+    日志会在网页「日志」页供用户按级别与订阅查阅）。
 
 ## 目录与命名速记（详见手册 §5）
 
