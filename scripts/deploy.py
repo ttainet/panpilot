@@ -49,7 +49,7 @@ HOSTNAME = "panpilot.ttai.net"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE_PATH = os.path.join(ROOT, "scripts", "deploy-state.json")
 DRIVER_TOKEN_PATH = os.path.join(ROOT, ".driver-token")
-EXPECTED_TABLES = {"subscriptions", "episodes", "candidates", "driver_tasks", "logs", "settings"}
+EXPECTED_TABLES = {"subscriptions", "episodes", "candidates", "driver_tasks", "logs", "settings", "driver_keys"}
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -195,6 +195,14 @@ def step_migrate(uuid: str) -> None:
     if status != 200 or not payload.get("success"):
         fail("migrate-verify-columns", status, payload)
     print("[migrate] verified subscriptions.poster_path / overview / rating columns")
+    # Spot-check the v0.6 driver_keys table exists.
+    status, payload = api(
+        "POST", f"/accounts/{ACCOUNT_ID}/d1/database/{uuid}/query",
+        {"sql": "SELECT id, token_hash FROM driver_keys LIMIT 0"},
+    )
+    if status != 200 or not payload.get("success"):
+        fail("migrate-verify-driver-keys", status, payload)
+    print("[migrate] verified driver_keys table")
 
 
 # ---------------------------------------------------------------------------

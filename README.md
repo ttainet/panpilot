@@ -1,9 +1,12 @@
 # PanPilot
 
-> Status: v0.5 — **deployed 2026-11-25** via the Cloudflare API to https://panpilot.ttai.net
+> Status: v0.6 — **deployed 2026-11-25** via the Cloudflare API to https://panpilot.ttai.net
 > (verified live: D1 store, password login, Driver auth); source is developed in the
 > public repository below.
-> 状态：v0.5 — **已于 2026-11-25 经 Cloudflare API 部署上线**并完成线上验证；源码在本仓库公开开发。设计见 [DESIGN.md](./DESIGN.md)。
+> 状态：v0.6 — **已于 2026-11-25 经 Cloudflare API 部署上线**并完成线上验证；源码在本仓库公开开发。设计见 [DESIGN.md](./DESIGN.md)。
+> v0.6 新增：Driver API Key 可在设置页按 Driver 命名创建/重置/吊销（服务端只存 SHA-256
+> 哈希，明文只显示一次），`GET /api/driver/config` 一并下发 TMDB API Key —— Driver
+> 需要的一切凭据都从 PanPilot 取，无有效 Key 时 Driver 接口一律 401、拿不到任何数据。
 > v0.5 新增：设置页可加密保存夸克 Cookie 供 Driver 取用转存（AES-GCM，见下方安全说明），
 > TG 频道列表可在设置页配置（默认预填 2026-11-23 验证的 147 个有效频道）。
 
@@ -94,8 +97,26 @@ see [DESIGN.md](./DESIGN.md). 完整设计（表结构、Driver API、状态机�
   the current browser is re-issued a fresh session.
   设置页可改登录用户名/密码：须验证当前密码，新密码以 PBKDF2 哈希存 settings 表
   并覆盖初始值；改完旧会话全部失效，本浏览器自动续上新会话。
-- **Driver API** uses a separate Bearer token (`DRIVER_TOKEN`), unaffected by web login.
-  Driver API 用独立的 Bearer Token，与网页登录互不影响。
+- **Driver API** is authenticated by an API key (`Authorization: Bearer <key>`),
+  unaffected by web login. Without a valid key every Driver endpoint returns
+  401 and exposes nothing — subscriptions, the Quark cookie, the TMDB key and
+  the channel list are all behind it.
+  Driver API 用独立的 API Key 鉴权，与网页登录互不影响；无有效 Key 时全部
+  Driver 接口返回 401，订阅、Cookie、TMDB Key、频道清单都拿不到。
+- **Driver API Keys （Driver 凭据管理）**: the settings page manages named keys,
+  one per Driver. A key looks like `ppk_` + 64 hex chars; the server stores
+  **only its SHA-256 hash** plus a display hint, and the plaintext is shown
+  **exactly once** when the key is created or reset. Reset revokes the old key
+  and issues a new one under the same name; revoke kills a key immediately.
+  The `DRIVER_TOKEN` Worker secret remains as a **bootstrap key**: always
+  valid, not listed in the UI; disable it by changing/removing the secret.
+  `GET /api/driver/config` provisions everything a Driver needs for a round —
+  the decrypted Quark cookie, the **TMDB API key**, and the effective channel
+  list — so a Driver holds no credentials of its own besides its PanPilot key.
+  设置页可按 Driver 命名创建/重置/吊销 API Key：服务端只存哈希与提示，
+  明文只在创建/重置时显示一次；`DRIVER_TOKEN` Secret 是始终有效的「系统引导
+  Key」（不在列表中，停用需改 Secret）。Driver 每轮经 config 接口取齐 Cookie、
+  TMDB Key 与频道清单，自身只需保管 PanPilot 的 Key。
 - **Settings page （设置页 `/settings`)**: save/update/clear your **TMDB API Key**.
   It is stored in the D1 `settings` table and only ever shown masked (last 4 chars).
   可在设置页配置 TMDB API Key（存 settings 表，页面只显示末 4 位掩码，可更新/清除）。

@@ -26,13 +26,30 @@
  * decrypted value, and the Driver reports validity back via
  * POST /api/driver/quark-status. TG channel lists are also configurable in
  * settings, defaulting to the verified seed lists in channels.ts.
+ *
+ * v0.6: Driver credentials are fully provisioned by PanPilot. The settings
+ * page manages named Driver API keys (driver_keys table): each token is
+ * "ppk_" + 32 random bytes (hex); the DB stores ONLY its SHA-256 hash plus
+ * a display hint, and the plaintext is returned exactly once, by the
+ * create/reset response. Keys can be reset (old row revoked, new key issued)
+ * and revoked. Driver auth accepts a UI key first and falls back to the
+ * DRIVER_TOKEN secret, which remains as an always-valid bootstrap key that
+ * is not listed in the UI. GET /api/driver/config now also returns the
+ * configured TMDB API key so a Driver needs no credentials of its own:
+ * without a valid key, every Driver endpoint answers 401 and no data
+ * (subscriptions, cookie, TMDB key, channels) can be read at all.
  */
 
 import { DEFAULT_TG_CHANNELS, PRIORITY_TG_CHANNELS } from "./channels";
 
 export interface Env {
   DB?: D1Database;
-  /** Driver Bearer token — set via `wrangler secret put DRIVER_TOKEN`. */
+  /**
+   * Bootstrap Driver API key — set via `wrangler secret put DRIVER_TOKEN`.
+   * Always valid and not listed in the settings UI; named per-Driver keys
+   * are managed in the driver_keys table instead (v0.6). Remove/change this
+   * secret to disable the bootstrap key.
+   */
   DRIVER_TOKEN?: string;
   /** Web login username — set via `wrangler secret put APP_USERNAME`. */
   APP_USERNAME?: string;
@@ -51,7 +68,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -135,6 +152,22 @@ export interface DriverTask {
 }
 
 export type ClaimResult = { task: DriverTask } | { conflict: true };
+
+/** A UI-managed Driver API key, as exposed to the web UI (never the hash). */
+export interface DriverKey {
+  id: string;
+  name: string;
+  /** Display hint only, e.g. "ppk_…ab12" — safe to show, useless as a credential. */
+  token_hint: string;
+  created_at: number;
+  last_used_at?: number;
+  revoked_at?: number;
+}
+
+/** Stored form of a DriverKey: adds the SHA-256 hash of the token. */
+export interface DriverKeyRecord extends DriverKey {
+  token_hash: string;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -350,16 +383,38 @@ async function webAuth(req: Request, env: Env, url: URL, store: Store): Promise<
   return new Response(null, { status: 302, headers: { location: `/login?next=${next}` } });
 }
 
-async function driverAuth(req: Request, env: Env): Promise<Response | null> {
-  if (!env.DRIVER_TOKEN) {
-    return err("driver_auth_not_configured", "DRIVER_TOKEN secret is not set on this Worker", 503);
-  }
+/** How long between last_used_at writes for a UI Driver key (seconds). */
+const DRIVER_KEY_TOUCH_SECONDS = 300;
+
+/**
+ * Driver auth (v0.6): the caller must present a valid API key —
+ *   1. a UI-managed key from the driver_keys table (looked up by SHA-256
+ *      hash; revoked rows never match), or
+ *   2. the DRIVER_TOKEN Worker secret (bootstrap key, always valid, not
+ *      listed in the UI; disable it by changing/removing the secret).
+ * No key (or a wrong one) → 401 and no data at all. A successful UI-key
+ * auth touches last_used_at, throttled to one write per
+ * DRIVER_KEY_TOUCH_SECONDS so a busy Driver does not hammer D1.
+ */
+async function driverAuth(req: Request, env: Env, store: Store): Promise<Response | null> {
   const auth = req.headers.get("authorization") ?? "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  if (!token || !(await safeEqual(token, env.DRIVER_TOKEN))) {
-    return err("unauthorized", "invalid driver token", 401);
+  if (!token) {
+    return err("unauthorized", "driver API key required (Authorization: Bearer <key>)", 401);
   }
-  return null;
+  const hash = await sha256Hex(token);
+  const rec = await store.getDriverKeyByHash(hash);
+  if (rec && !rec.revoked_at) {
+    const t = now();
+    if (rec.last_used_at == null || t - rec.last_used_at > DRIVER_KEY_TOUCH_SECONDS) {
+      await store.touchDriverKey(rec.id, t);
+    }
+    return null;
+  }
+  if (env.DRIVER_TOKEN && (await safeEqual(token, env.DRIVER_TOKEN))) {
+    return null;
+  }
+  return err("unauthorized", "invalid driver API key", 401);
 }
 
 // Simple per-isolate login rate limiting (best effort; isolates are ephemeral).
@@ -478,6 +533,14 @@ export interface Store {
   /** Stored-episode counts grouped by subscription and season (for stats / progress bars). */
   getStoredCounts(): Promise<{ subscription_id: string; season: number; count: number }[]>;
   addLog(entry: { subscription_id?: string; driver_id?: string; level: string; event: string; detail?: string }): Promise<void>;
+  /** UI-managed Driver API keys (v0.6), newest first, hashes included only where noted. */
+  listDriverKeys(): Promise<DriverKey[]>;
+  getDriverKey(id: string): Promise<DriverKeyRecord | null>;
+  getDriverKeyByHash(tokenHash: string): Promise<DriverKeyRecord | null>;
+  createDriverKey(rec: DriverKeyRecord): Promise<void>;
+  touchDriverKey(id: string, at: number): Promise<void>;
+  /** Mark a key revoked. Returns false when the id does not exist. */
+  revokeDriverKey(id: string, at: number): Promise<boolean>;
   getSetting(key: string): Promise<string | null>;
   setSetting(key: string, value: string): Promise<void>;
   deleteSetting(key: string): Promise<void>;
@@ -498,6 +561,7 @@ class MemoryStore implements Store {
   private episodes = new Map<string, EpisodeRecord>();
   private logs: unknown[] = [];
   private settings = new Map<string, string>();
+  private driverKeys = new Map<string, DriverKeyRecord>();
 
   async listSubscriptions() { return [...this.subs.values()]; }
   async getSubscription(id: string) { return this.subs.get(id) ?? null; }
@@ -574,6 +638,27 @@ class MemoryStore implements Store {
   async addLog(entry: { subscription_id?: string; driver_id?: string; level: string; event: string; detail?: string }) {
     this.logs.push({ ...entry, created_at: now() });
   }
+  async listDriverKeys(): Promise<DriverKey[]> {
+    return [...this.driverKeys.values()]
+      .sort((a, b) => b.created_at - a.created_at)
+      .map(({ token_hash: _hash, ...pub }) => pub);
+  }
+  async getDriverKey(id: string) { return this.driverKeys.get(id) ?? null; }
+  async getDriverKeyByHash(tokenHash: string) {
+    for (const rec of this.driverKeys.values()) if (rec.token_hash === tokenHash) return rec;
+    return null;
+  }
+  async createDriverKey(rec: DriverKeyRecord) { this.driverKeys.set(rec.id, { ...rec }); }
+  async touchDriverKey(id: string, at: number) {
+    const rec = this.driverKeys.get(id);
+    if (rec) rec.last_used_at = at;
+  }
+  async revokeDriverKey(id: string, at: number) {
+    const rec = this.driverKeys.get(id);
+    if (!rec) return false;
+    if (!rec.revoked_at) rec.revoked_at = at;
+    return true;
+  }
   async getSetting(key: string) { return this.settings.get(key) ?? null; }
   async setSetting(key: string, value: string) { this.settings.set(key, value); }
   async deleteSetting(key: string) { this.settings.delete(key); }
@@ -625,6 +710,19 @@ function rowToTask(r: Row): DriverTask {
   };
   if (r.heartbeat_at != null) task.heartbeat_at = Number(r.heartbeat_at);
   return task;
+}
+
+function rowToDriverKey(r: Row, withHash: boolean): DriverKey | DriverKeyRecord {
+  const key: DriverKey = {
+    id: String(r.id),
+    name: String(r.name),
+    token_hint: String(r.token_hint),
+    created_at: Number(r.created_at),
+  };
+  if (r.last_used_at != null) key.last_used_at = Number(r.last_used_at);
+  if (r.revoked_at != null) key.revoked_at = Number(r.revoked_at);
+  if (withHash) (key as DriverKeyRecord).token_hash = String(r.token_hash);
+  return key;
 }
 
 const SUB_COLUMNS = [
@@ -836,6 +934,44 @@ class D1Store implements Store {
       .prepare("INSERT INTO logs (id, subscription_id, driver_id, level, event, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
       .bind(uid(), entry.subscription_id ?? null, entry.driver_id ?? null, entry.level, entry.event, entry.detail ?? null, now())
       .run();
+  }
+
+  async listDriverKeys(): Promise<DriverKey[]> {
+    const res = await this.db
+      .prepare("SELECT id, name, token_hint, created_at, last_used_at, revoked_at FROM driver_keys ORDER BY created_at DESC")
+      .all<Row>();
+    return res.results.map((r) => rowToDriverKey(r, false));
+  }
+  async getDriverKey(id: string): Promise<DriverKeyRecord | null> {
+    const row = await this.db.prepare("SELECT * FROM driver_keys WHERE id = ?").bind(id).first<Row>();
+    return row ? (rowToDriverKey(row, true) as DriverKeyRecord) : null;
+  }
+  async getDriverKeyByHash(tokenHash: string): Promise<DriverKeyRecord | null> {
+    const row = await this.db.prepare("SELECT * FROM driver_keys WHERE token_hash = ?").bind(tokenHash).first<Row>();
+    return row ? (rowToDriverKey(row, true) as DriverKeyRecord) : null;
+  }
+  async createDriverKey(rec: DriverKeyRecord): Promise<void> {
+    await this.db
+      .prepare(
+        `INSERT INTO driver_keys (id, name, token_hash, token_hint, created_at, last_used_at, revoked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(rec.id, rec.name, rec.token_hash, rec.token_hint, rec.created_at,
+        rec.last_used_at ?? null, rec.revoked_at ?? null)
+      .run();
+  }
+  async touchDriverKey(id: string, at: number): Promise<void> {
+    await this.db.prepare("UPDATE driver_keys SET last_used_at = ? WHERE id = ?").bind(at, id).run();
+  }
+  async revokeDriverKey(id: string, at: number): Promise<boolean> {
+    const res = await this.db
+      .prepare("UPDATE driver_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+      .bind(at, id)
+      .run();
+    if ((res.meta.changes ?? 0) > 0) return true;
+    // Already revoked still counts as "exists" for idempotent revoke.
+    const row = await this.db.prepare("SELECT id FROM driver_keys WHERE id = ?").bind(id).first<Row>();
+    return !!row;
   }
 
   async getSetting(key: string): Promise<string | null> {
@@ -1115,6 +1251,92 @@ async function handleDriverLogs(req: Request, store: Store): Promise<Response> {
     accepted++;
   }
   return json({ accepted });
+}
+
+// ---------------------------------------------------------------------------
+// Driver API keys (web API, v0.6) — named keys managed from the settings page.
+// Only SHA-256 hashes are stored; the plaintext token is returned exactly
+// once by create/reset and never again by any endpoint.
+// ---------------------------------------------------------------------------
+
+/** Generate a fresh Driver key: "ppk_" + 32 random bytes as hex. */
+function generateDriverKeyMaterial(): { token: string; hint: string } {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  const hex = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const token = `ppk_${hex}`;
+  return { token, hint: `${token.slice(0, 4)}…${token.slice(-4)}` };
+}
+
+function publicDriverKey(rec: DriverKeyRecord): DriverKey {
+  const { token_hash: _hash, ...pub } = rec;
+  return pub;
+}
+
+async function insertDriverKey(store: Store, name: string): Promise<{ record: DriverKeyRecord; token: string }> {
+  const { token, hint } = generateDriverKeyMaterial();
+  const record: DriverKeyRecord = {
+    id: uid(),
+    name,
+    token_hash: await sha256Hex(token),
+    token_hint: hint,
+    created_at: now(),
+  };
+  await store.createDriverKey(record);
+  return { record, token };
+}
+
+/** GET /api/settings/driver-keys — list UI keys (hints only) + bootstrap status. */
+async function handleListDriverKeys(store: Store, env: Env): Promise<Response> {
+  return json({
+    driver_keys: await store.listDriverKeys(),
+    // The DRIVER_TOKEN secret is the bootstrap key: always valid, managed
+    // via Worker secrets, intentionally not part of this list.
+    bootstrap_key: { configured: !!env.DRIVER_TOKEN },
+  });
+}
+
+/** POST /api/settings/driver-keys {name} → 201 with the plaintext key ONCE. */
+async function handleCreateDriverKey(req: Request, store: Store): Promise<Response> {
+  const input = await body<{ name?: unknown }>(req);
+  const name = typeof input?.name === "string" ? input.name.trim() : "";
+  if (!name || name.length > 64 || /[\u0000-\u001f\u007f]/.test(name)) {
+    return err("bad_request", "name is required (1–64 chars, no control characters)", 400);
+  }
+  const { record, token } = await insertDriverKey(store, name);
+  await store.addLog({
+    level: "info", event: "driver_key_created",
+    detail: JSON.stringify({ id: record.id, name: record.name, hint: record.token_hint }),
+  });
+  return json({ key: token, driver_key: publicDriverKey(record) }, 201);
+}
+
+/**
+ * POST /api/settings/driver-keys/:id/reset — revoke the old row and issue a
+ * new key under the same name. Returns the new plaintext ONCE.
+ */
+async function handleResetDriverKey(store: Store, id: string): Promise<Response> {
+  const old = await store.getDriverKey(id);
+  if (!old) return err("not_found", "driver key not found", 404);
+  if (!old.revoked_at) await store.revokeDriverKey(id, now());
+  const { record, token } = await insertDriverKey(store, old.name);
+  await store.addLog({
+    level: "info", event: "driver_key_reset",
+    detail: JSON.stringify({ old_id: old.id, new_id: record.id, name: record.name, hint: record.token_hint }),
+  });
+  return json({ key: token, driver_key: publicDriverKey(record) }, 201);
+}
+
+/** POST /api/settings/driver-keys/:id/revoke — idempotent. */
+async function handleRevokeDriverKey(store: Store, id: string): Promise<Response> {
+  const rec = await store.getDriverKey(id);
+  if (!rec) return err("not_found", "driver key not found", 404);
+  if (rec.revoked_at) return json({ ok: true, already_revoked: true });
+  await store.revokeDriverKey(id, now());
+  await store.addLog({
+    level: "info", event: "driver_key_revoked",
+    detail: JSON.stringify({ id: rec.id, name: rec.name, hint: rec.token_hint }),
+  });
+  return json({ ok: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -1469,14 +1691,21 @@ async function getEffectiveChannels(store: Store): Promise<EffectiveChannels> {
 /** GET /api/driver/config — everything a Driver needs for a round. No-store. */
 async function handleDriverConfig(store: Store, env: Env): Promise<Response> {
   const cookie = await getQuarkCookiePlaintext(store, env);
+  // v0.6: the TMDB key is provisioned from PanPilot too, so a Driver needs
+  // no credentials of its own beyond its PanPilot API key.
+  const tmdbKey = await getTmdbApiKey(store);
   const eff = await getEffectiveChannels(store);
   await store.addLog({
     level: "info", event: "driver_config_fetched",
-    detail: JSON.stringify({ cookie: cookie != null, channels: eff.channels.length, priority_only: eff.priority_only }),
+    detail: JSON.stringify({
+      cookie: cookie != null, tmdb_key: tmdbKey != null,
+      channels: eff.channels.length, priority_only: eff.priority_only,
+    }),
   });
   return new Response(
     JSON.stringify({
       quark_cookie: cookie,
+      tmdb_api_key: tmdbKey,
       tg_channels: eff.channels,
       tg_channels_priority_only: eff.priority_only,
       tg_channels_priority_fallback: eff.priority_fallback,
@@ -2069,9 +2298,29 @@ function appHtml(initialView: string): string {
           </form>
           <p id="account-msg" class="muted"></p>
         </div>
+        <div class="card" id="card-driver-keys">
+          <h2>Driver API Key</h2>
+          <p class="muted">Driver 需要的一切凭据都从 PanPilot 取（夸克 Cookie、TMDB Key、频道清单），而取用前必须先凭 API Key 通过鉴权：请求头带 <code>Authorization: Bearer &lt;Key&gt;</code>，没有有效 Key 时所有 Driver 接口一律 401、拿不到任何数据。在这里可为每个 Driver 建独立 Key（建议一个 Driver 一个，名称写清是谁），也可重置（旧 Key 立即作废、生成新 Key）或吊销。Key 明文<strong>只在创建/重置时显示一次</strong>，服务端只保存它的 SHA-256 哈希，丢了只能重置。</p>
+          <p>当前 Key：<span id="driver-keys-status">加载中…</span></p>
+          <div id="driver-keys-list"></div>
+          <div id="dk-once" hidden style="border:1px solid rgba(240,179,92,.55);border-radius:10px;padding:.8rem .9rem;margin:.8rem 0">
+            <p style="color:var(--pp-amber);font-weight:600;margin:.1rem 0 .6rem">新 Key 只显示这一次，请立即复制并保存到 Driver 的配置里：</p>
+            <form class="inline" id="dk-once-form">
+              <input id="dk-once-value" readonly style="min-width:340px;flex:1;font-family:ui-monospace,Menlo,Consolas,monospace" autocomplete="off">
+              <button type="button" class="btn" id="dk-copy">复制</button>
+              <button type="button" class="btn btn-ghost" id="dk-once-close">我已保存，关闭</button>
+            </form>
+          </div>
+          <form id="dk-form" class="inline">
+            <input id="dk-name" placeholder="Driver 名称，如 claude-main / home-nas" style="min-width:280px" autocomplete="off">
+            <button type="submit" class="btn btn-primary">新建 Key</button>
+          </form>
+          <p id="dk-msg" class="muted"></p>
+          <p class="muted">说明：部署时设置的 DRIVER_TOKEN 是「系统引导 Key」，不在上面的列表里、始终有效；如需停用它，要修改 Worker 的 DRIVER_TOKEN Secret。</p>
+        </div>
         <div class="card">
           <h2>Driver</h2>
-          <p class="muted">Driver 检查间隔：<span id="interval">…</span> 小时一轮（由 Worker 环境变量 CHECK_INTERVAL_HOURS 控制，默认 6）。Driver API 使用独立 Bearer Token，与网页登录互不影响。</p>
+          <p class="muted">Driver 检查间隔：<span id="interval">…</span> 小时一轮（由 Worker 环境变量 CHECK_INTERVAL_HOURS 控制，默认 6）。Driver API 使用独立 API Key（见上方卡片），与网页登录互不影响。</p>
         </div>
       </section>
 
@@ -2389,6 +2638,7 @@ async function loadSettings() {
   document.getElementById('topbar-user').textContent = uname || '';
   renderCookieSettings(data.settings.quark_cookie);
   renderChannelSettings(data.settings.tg_channels);
+  loadDriverKeys();
 }
 function renderCookieSettings(c) {
   var st = document.getElementById('cookie-status');
@@ -2439,6 +2689,97 @@ function renderChannelSettings(t) {
     + '；当前生效 ' + t.count + ' 个'
     + (t.priority_only ? (t.priority_fallback ? '（优先开关已开，但与优先集无交集，已退回全量）' : '（仅夸克优先 ' + t.priority_count + ' 个）') : '');
 }
+/* ---------- settings: Driver API keys ---------- */
+function showOnceKey(token) {
+  var box = document.getElementById('dk-once');
+  document.getElementById('dk-once-value').value = token;
+  box.hidden = false;
+  box.scrollIntoView({ block: 'nearest' });
+}
+document.getElementById('dk-copy').addEventListener('click', function () {
+  var input = document.getElementById('dk-once-value');
+  input.select();
+  var done = function () { document.getElementById('dk-msg').textContent = '已复制到剪贴板。'; };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(input.value).then(done, function () {
+      document.execCommand('copy'); done();
+    });
+  } else {
+    document.execCommand('copy'); done();
+  }
+});
+document.getElementById('dk-once-close').addEventListener('click', function () {
+  document.getElementById('dk-once').hidden = true;
+  document.getElementById('dk-once-value').value = '';
+});
+async function loadDriverKeys() {
+  var st = document.getElementById('driver-keys-status');
+  var box = document.getElementById('driver-keys-list');
+  var r = await api('/api/settings/driver-keys');
+  var data = await r.json().catch(function () { return null; });
+  if (!r.ok || !data) { st.textContent = '加载失败'; return; }
+  var keys = data.driver_keys || [];
+  var active = keys.filter(function (k) { return !k.revoked_at; }).length;
+  st.textContent = '共 ' + keys.length + ' 个（' + active + ' 个有效）'
+    + (data.bootstrap_key && data.bootstrap_key.configured ? '，另有系统引导 Key（不在列表中）' : '');
+  if (!keys.length) {
+    box.innerHTML = '<p class="muted">还没有用页面创建的 Key。在下方输入名称新建一个给你的 Driver 用。</p>';
+    return;
+  }
+  box.innerHTML = keys.map(function (k) {
+    var isActive = !k.revoked_at;
+    var actions = isActive
+      ? '<button class="btn btn-ghost" data-dk-reset="' + k.id + '">重置</button>'
+        + '<button class="btn btn-danger" data-dk-revoke="' + k.id + '">吊销</button>'
+      : '';
+    return '<div class="recent-row"><div class="recent-main">'
+      + '<div class="recent-title">' + esc(k.name) + ' <span class="tag">' + esc(k.token_hint) + '</span></div>'
+      + '<div class="recent-sub">创建于 ' + fmtTime(k.created_at)
+      + ' · 最近使用：' + (k.last_used_at ? fmtTime(k.last_used_at) : '从未')
+      + (k.revoked_at ? ' · 吊销于 ' + fmtTime(k.revoked_at) : '') + '</div></div>'
+      + (isActive ? '<span class="badge b-done">有效</span>' : '<span class="badge b-paused">已吊销</span>')
+      + actions + '</div>';
+  }).join('');
+}
+document.getElementById('driver-keys-list').addEventListener('click', async function (e) {
+  var resetBtn = e.target.closest('button[data-dk-reset]');
+  var revokeBtn = e.target.closest('button[data-dk-revoke]');
+  var msg = document.getElementById('dk-msg');
+  if (resetBtn) {
+    if (!confirm('确定重置这个 Key 吗？旧 Key 立即作废，使用它的 Driver 必须换上新 Key 才能继续工作。')) return;
+    var rr = await fetch('/api/settings/driver-keys/' + resetBtn.getAttribute('data-dk-reset') + '/reset', { method: 'POST' });
+    var rd = await rr.json().catch(function () { return null; });
+    if (!rr.ok) { msg.textContent = rd && rd.error ? rd.error.message : '重置失败'; return; }
+    msg.textContent = '已重置：旧 Key 已吊销，新 Key 见上方（只显示一次）。';
+    showOnceKey(rd.key);
+    loadDriverKeys();
+    return;
+  }
+  if (revokeBtn) {
+    if (!confirm('确定吊销这个 Key 吗？使用它的 Driver 将立刻无法访问，此操作不可恢复（只能新建）。')) return;
+    var vr = await fetch('/api/settings/driver-keys/' + revokeBtn.getAttribute('data-dk-revoke') + '/revoke', { method: 'POST' });
+    var vd = await vr.json().catch(function () { return null; });
+    if (!vr.ok) { msg.textContent = vd && vd.error ? vd.error.message : '吊销失败'; return; }
+    msg.textContent = '已吊销。';
+    loadDriverKeys();
+  }
+});
+document.getElementById('dk-form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  var msg = document.getElementById('dk-msg');
+  var name = document.getElementById('dk-name').value.trim();
+  if (!name) { msg.textContent = '请先填写 Driver 名称'; return; }
+  var r = await fetch('/api/settings/driver-keys', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: name })
+  });
+  var data = await r.json().catch(function () { return null; });
+  if (!r.ok) { msg.textContent = data && data.error ? data.error.message : '创建失败'; return; }
+  document.getElementById('dk-name').value = '';
+  msg.textContent = '已创建：把上方 Key 配置到 Driver 里（只显示一次）。';
+  showOnceKey(data.key);
+  loadDriverKeys();
+});
 document.getElementById('account-form').addEventListener('submit', async function (e) {
   e.preventDefault();
   var msg = document.getElementById('account-msg');
@@ -2565,21 +2906,23 @@ export default {
     try {
       // Public endpoints.
       if (pathname === "/api/health") {
+        const hasUiKey = (await store.listDriverKeys()).some((k) => !k.revoked_at);
         return json({
           ok: true,
           version: VERSION,
           store: store.kind,
           web_auth: (await getEffectiveAuth(env, store)) ? "password" : "disabled",
-          driver_auth: env.DRIVER_TOKEN ? "configured" : "not_configured",
+          driver_auth: env.DRIVER_TOKEN || hasUiKey ? "configured" : "not_configured",
           time: now(),
         });
       }
       if (pathname === "/login") return handleLogin(req, env, url, store);
       if (pathname === "/logout" && req.method === "POST") return handleLogout();
 
-      // Driver API — independent Bearer token, unaffected by web login.
+      // Driver API — independent API key (UI-managed key or bootstrap
+      // DRIVER_TOKEN secret), unaffected by web login.
       if (pathname.startsWith("/api/driver/")) {
-        const denied = await driverAuth(req, env);
+        const denied = await driverAuth(req, env, store);
         if (denied) return denied;
         if (pathname === "/api/driver/pending" && req.method === "GET") return handleDriverPending(url, store);
         if (pathname === "/api/driver/claim" && req.method === "POST") return handleDriverClaim(req, store);
@@ -2623,6 +2966,20 @@ export default {
       }
 
       if (pathname === "/api/stats" && req.method === "GET") return handleStats(store);
+
+      if (pathname === "/api/settings/driver-keys" || pathname.startsWith("/api/settings/driver-keys/")) {
+        if (pathname === "/api/settings/driver-keys") {
+          if (req.method === "GET") return handleListDriverKeys(store, env);
+          if (req.method === "POST") return handleCreateDriverKey(req, store);
+        }
+        const km = pathname.match(/^\/api\/settings\/driver-keys\/([^/]+)\/(reset|revoke)$/);
+        if (km && req.method === "POST") {
+          const keyId = decodeURIComponent(km[1]);
+          if (km[2] === "reset") return handleResetDriverKey(store, keyId);
+          return handleRevokeDriverKey(store, keyId);
+        }
+        return err("not_found", "unknown driver-keys endpoint", 404);
+      }
 
       if (pathname === "/api/settings") {
         if (req.method === "GET") return handleGetSettings(store, env);

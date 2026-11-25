@@ -1,7 +1,16 @@
-# PanPilot 设计稿 v0.5（已部署上线）
+# PanPilot 设计稿 v0.6（已部署上线）
 
-> 状态：v0.5 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
-> 线上验证（health 为 store=d1、登录与 Driver Token 鉴权正常）。本文档描述目标架构与接口契约。
+> 状态：v0.6 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
+> 线上验证（health 为 store=d1、登录与 Driver 鉴权正常）。本文档描述目标架构与接口契约。
+>
+> v0.6 变更（用户拍板）：**Driver 需要的一切凭据都从 PanPilot 下发** ——
+> `GET /api/driver/config` 在夸克 Cookie、频道清单之外新增下发 TMDB API Key；
+> Driver 访问 PanPilot 必须凭 **API Key**，无有效 Key 时全部 Driver 接口 401、
+> 拿不到任何数据。此前以 `DRIVER_TOKEN` Secret 实现的单一 Token 产品化为
+> **后台可管理的命名 Key**（新表 `driver_keys`，见 §4.7）：每个 Driver 可有
+> 自己的 Key，可在设置页创建/重置/吊销；DB 只存 SHA-256 哈希，明文仅在
+> 创建/重置响应中出现一次。`DRIVER_TOKEN` 保留为「系统引导 Key」：始终有效、
+> 不在 UI 列表中，停用需改 Worker Secret（详见 §7）。
 >
 > v0.5 变更（均为用户明确拍板）：(1) **推翻此前「控制面不存 Cookie」的设计** —— 设置页可
 > 配置夸克 Cookie，但只以 **AES-GCM 加密**形式存 settings 表（密钥为 Worker Secret
@@ -52,7 +61,7 @@ PanPilot 是一个**影视订阅控制面**，部署在 Cloudflare Workers 上�
 │                                    candidates / driver_tasks /     │
 │                                    logs / settings                 │
 └──────────────────────────────┬─────────────────────────────────────┘
-                               │ Driver API（独立 Bearer Token, HTTPS）
+                               │ Driver API（API Key 鉴权, HTTPS）
               ┌────────────────┴─────────────────┐
               ▼                                  ▼
      Driver v1: Muse                    Driver v2: 自写程序
@@ -199,6 +208,23 @@ Secret 中，不进 D1/代码/日志）。网页端永远看不到 Cookie（明�
 `auth_username` / `auth_password` 为网页登录凭据的**后台覆盖值**（见 §7）：`auth_password`
 存 PBKDF2-SHA256 哈希对象 `{salt, iterations, hash}`（随机盐，100k 次迭代），绝不存明文。
 
+### 4.7 driver_keys — Driver API Key（v0.6，迁移 `0003_driver_keys.sql`）
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| id | TEXT PK | UUID |
+| name | TEXT NOT NULL | Driver 名称，如 `claude-main`、`home-nas-01`，一个 Driver 一个 Key |
+| token_hash | TEXT NOT NULL UNIQUE | 完整 Token 的 **SHA-256 hex**；Token 本体为 `ppk_` + 32 字节随机数 hex |
+| token_hint | TEXT NOT NULL | 展示提示，如 `ppk_…ab12`（首 4 + 末 4），仅供辨认，不是凭据 |
+| created_at | INTEGER NOT NULL | |
+| last_used_at | INTEGER | 最近一次鉴权成功时间；写入节流（>5 分钟才更新），避免高频写库 |
+| revoked_at | INTEGER | NULL = 有效；非空 = 已吊销（重置旧行、手动吊销都写这里） |
+
+明文 Token **只在创建/重置的响应里出现一次**，之后任何接口（包括列表）都只返回
+name / hint / 时间 / 状态。创建、重置、吊销各写一条审计日志（detail 只含 id/name/hint，
+不含明文）。鉴权时对请求 Token 做 SHA-256 后按 `token_hash` 查未吊销行；
+未命中再回落 `DRIVER_TOKEN` Secret（引导 Key）的常量时间比较。
+
 ## 5. 订阅状态机
 
 ```
@@ -229,7 +255,7 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
 | `POST /api/driver/progress` | 回写集进度与订阅状态 | `{ task_id, episodes: [{season, episode, status, source_share_code?, quark_fid?, file_name?, file_size?}], subscription_status?, next_check_at?, note? }` |
 | `POST /api/driver/heartbeat` | 续约 + 存活上报 | `{ task_id, driver_id }` → `{ lease_expires_at }`；同时可上报 `driver_status`（如 `quark_login_ok: false`） |
 | `POST /api/driver/logs`（可选） | 批量上报日志 | `{ task_id?, logs: [{level, event, detail?}] }` |
-| `GET /api/driver/config` | 取本轮执行配置（v0.5） | → `{ quark_cookie: string\|null, tg_channels: string[], tg_channels_priority_only, tg_channels_priority_fallback, check_interval_hours }`；响应 `Cache-Control: no-store`；每次取用写一条审计日志（只记事件不记内容） |
+| `GET /api/driver/config` | 取本轮执行配置（v0.5；v0.6 新增 TMDB Key 下发） | → `{ quark_cookie: string\|null, tmdb_api_key: string\|null, tg_channels: string[], tg_channels_priority_only, tg_channels_priority_fallback, check_interval_hours }`；响应 `Cache-Control: no-store`；每次取用写一条审计日志（只记事件与存在性，不记内容） |
 | `POST /api/driver/quark-status` | 回报夸克 Cookie 有效性（v0.5） | `{ status: "ok"\|"invalid", note?, driver_id? }` → 存 settings 并在设置页展示；`invalid` 时页面红色提示重新粘贴 |
 
 网页端 API（非 Driver）：
@@ -240,6 +266,10 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
 | `GET /api/subscriptions` / `POST /api/subscriptions` | 订阅列表 / 新建 |
 | `GET /api/subscriptions/:id` / `PATCH /api/subscriptions/:id` / `DELETE /api/subscriptions/:id` | 详情 / 改（状态、模式、画质、暂停等）/ 删除 |
 | `POST /api/subscriptions/:id/confirm-candidate` | manual 模式下人工确认候选（后续阶段，骨架中为签名占位） |
+| `GET /api/settings/driver-keys` | Driver API Key 列表（仅 name/hint/时间/状态，永不返回明文或哈希）（v0.6） |
+| `POST /api/settings/driver-keys` | 新建命名 Key `{name}` → 201 `{ key: 明文（仅此一次）, driver_key }`（v0.6） |
+| `POST /api/settings/driver-keys/:id/reset` | 吊销旧行并新建同名 Key → 201 返回新明文一次（v0.6） |
+| `POST /api/settings/driver-keys/:id/revoke` | 吊销该 Key（幂等）（v0.6） |
 
 ## 7. 鉴权
 
@@ -256,10 +286,19 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
   会话 payload 内嵌凭据指纹（由当前有效凭据材料哈希得出），改密后指纹变化，
   **所有旧会话自动失效**；改密接口本身会为当前浏览器签发新会话，不把用户锁在门外。
   仅改用户名时，会把刚验证通过的当前密码一并哈希落库，保证覆盖对始终完整。
-- **Driver**：独立 **Bearer Token**（`DRIVER_TOKEN` 存为 Worker Secret），与网页端凭据分离、
-  可单独轮换。请求头：`Authorization: Bearer <token>`。Token 只授予 §6 的 driver 路径，
-  不能调用网页端写接口。比较时用常量时间比较（基于 SHA-256 摘要），避免时序侧信道。
-- 所有密钥只通过 `wrangler secret put` 注入，**不进 git、不进 wrangler.toml**。
+- **Driver（v0.6 修订）**：独立 **API Key**，与网页端凭据分离。请求头：
+  `Authorization: Bearer <key>`。Key 只授予 §6 的 driver 路径，不能调用网页端接口。
+  鉴权顺序：先查 UI 管理的命名 Key（`driver_keys` 表，对 Token 做 SHA-256 后按哈希查
+  未吊销行；命中后节流更新 `last_used_at`），未命中再回落 **`DRIVER_TOKEN` Secret
+  （系统引导 Key）** 的常量时间比较（基于 SHA-256 摘要，避免时序侧信道）。
+  引导 Key 始终有效、不在设置页列表中，停用/轮换只能改 Worker Secret；
+  UI Key 则可在设置页按 Driver 命名创建、重置（旧行吊销 + 新建同名）、吊销，
+  DB 只存哈希，明文只在创建/重置时出现一次（见 §4.7）。
+  **没有有效 Key 时，全部 Driver 接口一律 401**：订阅、候选、进度、夸克 Cookie、
+  TMDB Key、频道清单都拿不到 —— Driver 需要的凭据全部经 PanPilot 下发，
+  前提就是先持有 PanPilot 的 Key。
+- 所有 Worker Secret 只通过 `wrangler secret put` 注入，**不进 git、不进 wrangler.toml**；
+  UI Key 的哈希在 D1 中，明文不落库、不进日志。
 
 ## 8. Driver 执行流程（标准一轮）
 
@@ -290,7 +329,12 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
   **风险提示**：若 D1 数据与 `COOKIE_ENC_SECRET` 同时泄露，Cookie 即等同泄露；Cookie
   本身等同登录凭证，失效或怀疑泄露时应在夸克端退出登录/改密使其作废，并在设置页清除
   或更新。未配置 `COOKIE_ENC_SECRET` 时功能硬禁用，不存在明文保存路径。
-- Driver Token 与网页端凭据分离存储、分离轮换；日志 detail 禁止写入 Token/Cookie。
+- Driver Key 与网页端凭据分离存储、分离轮换；日志 detail 禁止写入任何 Key/Cookie/TMDB 明文。
+- Driver API Key（v0.6）：D1 只存 SHA-256 哈希与展示 hint，即使 D1 泄露也无法反推 Key；
+  一个 Driver 一个 Key，单个 Key 泄露时只需吊销它，不影响其他 Driver 与引导 Key；
+  引导 Key（`DRIVER_TOKEN` Secret）与 D1 分离保管，是 UI Key 体系失效时的兜底通道。
+  config 接口下发的 TMDB Key 与夸克 Cookie 只经通过鉴权的 Driver 通道出站（no-store），
+  网页端设置接口对 TMDB Key 仍只给掩码、对 Cookie 仍只给状态元数据。
 - 转存是夸克服务端内的操作，文件数据不经过 Workers，也不经过 Driver 的下载/上传中转。
 - 执行频率克制：默认检查间隔 ≥ 6 小时、认领后串行处理，避免高频调用触发平台风控；
   频率是 settings 可调项，但有下限保护（TODO）。
@@ -325,6 +369,14 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
    仅 Driver 可取明文，设计与风险提示见 §9），Driver 拿到 Cookie 直接调夸克接口转存，
    不再强依赖浏览器登录态。同时 TG 频道列表可在设置页配置，默认预填已验证的
    147 个有效频道（其中 76 个夸克优先，见 §4.6）。
+
+已定（2026-11-25 用户追加拍板，v0.6 已实现并本地验证）：
+
+7. ~~Driver 凭据各自保管~~ **已定**：Driver 需要的一切凭据（夸克 Cookie、TMDB API Key、
+   频道清单）都经 PanPilot 的 `GET /api/driver/config` 下发，Driver 自身只持有
+   PanPilot 的 API Key。API Key 后台可管理：每个 Driver 可命名创建自己的 Key，
+   可重置、可吊销，DB 只存 SHA-256 哈希、明文只出现一次；`DRIVER_TOKEN` Secret
+   保留为系统引导 Key（见 §4.7、§7）。无有效 Key 时 Driver 接口一律 401。
 
 仍待定：
 
