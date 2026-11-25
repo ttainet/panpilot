@@ -14,7 +14,9 @@
  *       华语电影/ 外语电影/ 动画电影/
  *
  * Title folders are "{title} ({year})", TV gets a "Season {N}" layer,
- * episode files are "{title} - S{ss}E{ee} - 第 {e} 集.<ext>".
+ * episode files are "{title} - S{ss}E{ee} - 第 {e} 集.<ext>", movie files are
+ * "{title} ({year})<ext>" (movie_name_template, no extension in the
+ * template) and variety files use 第 {e} 期 (variety_name_template, v0.9).
  *
  * The whole object is user-editable on the settings page and stored as the
  * `directories` settings key (JSON). When the key is absent these defaults
@@ -43,6 +45,16 @@ export interface DirectorySettings {
   /** Episode file name template (without extension); placeholders:
    *  {title} {season} {season:02} {episode} {episode:02}. */
   episode_name_template: string;
+  /** Movie file name template (without extension); the file lives directly
+   *  in the title folder (no Season layer). Placeholders: {title} {year}.
+   *  Added in v0.9; older stored settings without this key fall back to the
+   *  default (see resolveDirectories). */
+  movie_name_template: string;
+  /** Variety file name template (without extension); like the episode
+   *  template but the counter is a 期 (issue), not a 集.
+   *  Placeholders: {title} {season} {season:02} {episode} {episode:02}.
+   *  Added in v0.9; older stored settings fall back to the default. */
+  variety_name_template: string;
 }
 
 export const DEFAULT_DIRECTORIES: DirectorySettings = {
@@ -55,11 +67,16 @@ export const DEFAULT_DIRECTORIES: DirectorySettings = {
   title_template: "{title} ({year})",
   season_template: "Season {season}",
   episode_name_template: "{title} - S{season:02}E{episode:02} - 第 {episode} 集",
+  movie_name_template: "{title} ({year})",
+  variety_name_template: "{title} - S{season:02}E{episode:02} - 第 {episode} 期",
 };
 
 const PATH_FIELDS = ["base_dir", "tv_dir", "movie_dir"] as const;
 const MAP_FIELDS = ["tv_region_map", "tv_special_map", "movie_category_map"] as const;
-const TEMPLATE_FIELDS = ["title_template", "season_template", "episode_name_template"] as const;
+const TEMPLATE_FIELDS = [
+  "title_template", "season_template", "episode_name_template",
+  "movie_name_template", "variety_name_template",
+] as const;
 
 /** A single library path (may contain "/" separators, but no leading/trailing
  *  slash, no empty segments, no backslashes, no ".."). */
@@ -116,15 +133,25 @@ export function validateDirectories(input: unknown): { value?: DirectorySettings
     out[f] = m;
   }
   for (const f of TEMPLATE_FIELDS) {
-    if (!isValidTemplate(o[f])) {
+    // Backward compatibility: a template key added in a later version
+    // (movie_name_template / variety_name_template, v0.9) may be absent
+    // from an older client's payload — fill the default instead of 400.
+    const raw = o[f] === undefined ? DEFAULT_DIRECTORIES[f] : o[f];
+    if (!isValidTemplate(raw)) {
       return { error: `${f} 不合法：应为非空字符串且不含斜杠` };
     }
-    out[f] = (o[f] as string).trim();
+    out[f] = (raw as string).trim();
   }
   if (!out.title_template.includes("{title}")) return { error: "title_template 必须包含 {title}" };
   if (!out.season_template.includes("{season")) return { error: "season_template 必须包含 {season}" };
   if (!out.episode_name_template.includes("{episode")) {
     return { error: "episode_name_template 必须包含 {episode}" };
+  }
+  if (!out.movie_name_template.includes("{title}")) {
+    return { error: "movie_name_template 必须包含 {title}" };
+  }
+  if (!out.variety_name_template.includes("{episode")) {
+    return { error: "variety_name_template 必须包含 {episode}" };
   }
   return { value: out };
 }

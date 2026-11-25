@@ -1,9 +1,13 @@
 # PanPilot
 
-> Status: v0.8 — **deployed 2026-11-25** via the Cloudflare API to https://panpilot.ttai.net
+> Status: v0.9 — **deployed 2026-11-25** via the Cloudflare API to https://panpilot.ttai.net
 > (verified live: D1 store, password login, Driver auth); source is developed in the
 > public repository below.
-> 状态：v0.8 — **已于 2026-11-25 经 Cloudflare API 部署上线**并完成线上验证；源码在本仓库公开开发。设计见 [DESIGN.md](./DESIGN.md)。
+> 状态：v0.9 — **已于 2026-11-25 经 Cloudflare API 部署上线**并完成线上验证；源码在本仓库公开开发。设计见 [DESIGN.md](./DESIGN.md)。
+> v0.9 变更：AI Driver 手册的「目录与命名规范」重写为可直接执行的决策顺序与精确
+> 模板（先盘点复用已有剧名夹、季集解析、正反例、字幕跟随、同季不混版本、不确定
+> 就停）；`directories` 新增电影/综艺命名模板（movie_name_template /
+> variety_name_template），旧设置缺键自动补默认。
 > v0.8 变更：设置页按功能拆成 Tab（账号 / 媒体信息 / 网盘 / 搜索源 / 入库目录 / Driver），
 > Tab 状态写 URL hash、需关注的页签带红点提示；纯界面调整，接口与行为不变。
 > v0.7 新增：入库目录做成设置页可改的 `directories` 设置（默认值与用户夸克真实

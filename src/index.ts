@@ -57,6 +57,18 @@
  * refreshes and deep links restore it; tabs that need attention (TMDB key
  * missing, Quark cookie missing/invalid) get a red dot on their label.
  * No API, field, or behavior changes.
+ *
+ * v0.9: the AI Driver guide's directory & naming rules are rewritten to be
+ * executable without guessing (docs/AI_DRIVER_GUIDE.md §5: target-path
+ * decision order — inventory first and reuse an existing title folder,
+ * never create a second home; season/episode parsing rules; exact naming
+ * templates with positive/negative examples; subtitle following; quality
+ * consistency within a season; stop-don't-guess). Companion change:
+ * `directories` gains two naming templates — movie_name_template
+ * ("{title} ({year})") and variety_name_template (…第 {episode} 期) —
+ * editable on the settings page, returned by GET /api/driver/config, and
+ * backfilled from defaults when an older stored settings object lacks
+ * them (no error).
  */
 
 import {
@@ -95,7 +107,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "0.8.0";
+const VERSION = "0.9.0";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -2401,7 +2413,7 @@ function appHtml(initialView: string): string {
         <div class="settings-panel" id="spanel-directories">
         <div class="card" id="card-directories">
           <h2>入库目录</h2>
-          <p class="muted">Driver 转存入库时使用的网盘目录规范，分类判定以这里的映射为准（Driver 每轮从配置接口读取生效值）。默认值按夸克实际结构预填：电视剧与电影都在根目录下，日韩合并为「日韩剧」，国漫/纪录片/综艺都在电视剧下，电影分华语/外语/动画。映射一行一条，格式「代码=文件夹名」：地区代码为 TMDB 原产地代码（CN/JP/KR 等），* 表示其他地区；电影映射里 animation 表示动画电影；电视剧特殊分类的键为 animation_cn（国漫）/ documentary（纪录片）/ variety（综艺）。模板占位符：{title} {year} {season} {episode}，:02 表示两位零填充。</p>
+          <p class="muted">Driver 转存入库时使用的网盘目录规范，分类判定以这里的映射为准（Driver 每轮从配置接口读取生效值）。默认值按夸克实际结构预填：电视剧与电影都在根目录下，日韩合并为「日韩剧」，国漫/纪录片/综艺都在电视剧下，电影分华语/外语/动画。映射一行一条，格式「代码=文件夹名」：地区代码为 TMDB 原产地代码（CN/JP/KR 等），* 表示其他地区；电影映射里 animation 表示动画电影；电视剧特殊分类的键为 animation_cn（国漫）/ documentary（纪录片）/ variety（综艺）。模板占位符：{title} {year} {season} {episode}，:02 表示两位零填充。电影文件与综艺文件各有独立模板：电影无 Season 层、文件名直接放剧名夹；综艺按「期」计。</p>
           <p>当前状态：<span id="directories-status">加载中…</span></p>
           <form id="directories-form">
             <div style="display:flex;flex-wrap:wrap;gap:.55rem;align-items:center">
@@ -2421,7 +2433,12 @@ function appHtml(initialView: string): string {
               <label class="muted">季夹 <input id="dir-season-template" style="width:150px"></label>
               <label class="muted">单集文件 <input id="dir-episode-template" style="width:300px"></label>
             </div>
+            <div style="display:flex;flex-wrap:wrap;gap:.55rem;align-items:center;margin-top:.45rem">
+              <label class="muted">电影文件 <input id="dir-movie-name-template" style="width:200px"></label>
+              <label class="muted">综艺文件 <input id="dir-variety-template" style="width:300px"></label>
+            </div>
             <p class="muted">示例路径：<span id="directories-preview">—</span></p>
+            <p class="muted">电影示例：<span id="directories-preview-movie">—</span>　综艺示例：<span id="directories-preview-variety">—</span></p>
             <div style="display:flex;flex-wrap:wrap;gap:.55rem;align-items:center;margin-top:.7rem">
               <button type="submit" class="btn btn-primary">保存目录设置</button>
               <button type="button" class="btn" id="directories-reset">恢复默认</button>
@@ -2906,7 +2923,9 @@ function collectDirectories() {
     movie_category_map: textToMap(document.getElementById('dir-movie-category').value),
     title_template: document.getElementById('dir-title-template').value.trim(),
     season_template: document.getElementById('dir-season-template').value.trim(),
-    episode_name_template: document.getElementById('dir-episode-template').value.trim()
+    episode_name_template: document.getElementById('dir-episode-template').value.trim(),
+    movie_name_template: document.getElementById('dir-movie-name-template').value.trim(),
+    variety_name_template: document.getElementById('dir-variety-template').value.trim()
   };
 }
 function dirPreviewOf(d) {
@@ -2918,8 +2937,21 @@ function dirPreviewOf(d) {
   var region = (d.tv_region_map && (d.tv_region_map.CN || d.tv_region_map['*'])) || '';
   return [d.base_dir, d.tv_dir, region, title, season, ep + '.mkv'].filter(Boolean).join('/');
 }
+function renderNameTemplate(tpl, title, year) {
+  return String(tpl || '').split('{title}').join(title).split('{year}').join(year)
+    .split('{season:02}').join('01').split('{season}').join('1')
+    .split('{episode:02}').join('01').split('{episode}').join('1');
+}
 function updateDirPreview() {
-  document.getElementById('directories-preview').textContent = dirPreviewOf(collectDirectories());
+  var d = collectDirectories();
+  document.getElementById('directories-preview').textContent = dirPreviewOf(d);
+  var title = renderNameTemplate(d.title_template, '独行月球', '2022');
+  var cat = (d.movie_category_map && (d.movie_category_map.CN || d.movie_category_map['*'])) || '';
+  var movieFile = renderNameTemplate(d.movie_name_template, '独行月球', '2022');
+  document.getElementById('directories-preview-movie').textContent =
+    [d.base_dir, d.movie_dir, cat, title, movieFile + '.mkv'].filter(Boolean).join('/');
+  document.getElementById('directories-preview-variety').textContent =
+    renderNameTemplate(d.variety_name_template, '奔跑吧', '2026') + '.mkv';
 }
 function renderDirectorySettings(d, custom) {
   var st = document.getElementById('directories-status');
@@ -2933,6 +2965,8 @@ function renderDirectorySettings(d, custom) {
   document.getElementById('dir-title-template').value = d.title_template || '';
   document.getElementById('dir-season-template').value = d.season_template || '';
   document.getElementById('dir-episode-template').value = d.episode_name_template || '';
+  document.getElementById('dir-movie-name-template').value = d.movie_name_template || '';
+  document.getElementById('dir-variety-template').value = d.variety_name_template || '';
   st.textContent = custom ? '使用自定义设置' : '使用默认设置（按夸克实际结构预填）';
   updateDirPreview();
 }

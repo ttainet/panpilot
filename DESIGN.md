@@ -1,7 +1,13 @@
-# PanPilot 设计稿 v0.8（已部署上线）
+# PanPilot 设计稿 v0.9（已部署上线）
 
-> 状态：v0.8 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
+> 状态：v0.9 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
 > 线上验证（health 为 store=d1、登录与 Driver 鉴权正常）。本文档描述目标架构与接口契约。
+>
+> v0.9 变更：AI Driver 手册（docs/AI_DRIVER_GUIDE.md §5）把目录与命名规则重写为
+> 明确无歧义的决策顺序 + 精确模板 + 正反例（先盘点复用已有剧名夹、季集解析规则、
+> 字幕跟随、同季画质一致、不确定就停），AGENTS.md 同步精简版；`directories` 新增
+> 电影与综艺两个命名模板键 `movie_name_template` / `variety_name_template`
+> （设置页可改、Driver config 下发；旧设置缺键时读取自动补默认、不报错）。
 >
 > v0.8 变更：设置页按功能域拆成 Tab（账号 / 媒体信息 / 网盘 / 搜索源 / 入库目录 / Driver），
 > 面板仅以 display:none 隐藏（未保存编辑切走不丢），激活 Tab 同步到 URL hash，
@@ -110,9 +116,12 @@ Secret 中，不进 D1/代码/日志）。网页端永远看不到 Cookie（明�
        / {剧名} ({年份}) /（电影文件，无 Season 层；剧名夹也可直放电影层）
 ```
 
-- 模板（title_template / season_template / episode_name_template）同在
-  `directories` 里，默认值分别为 `{title} ({year})`、`Season {season}`、
-  `{title} - S{season:02}E{episode:02} - 第 {episode} 集`。
+- 模板（title_template / season_template / episode_name_template /
+  movie_name_template / variety_name_template）同在 `directories` 里，默认值
+  分别为 `{title} ({year})`、`Season {season}`、
+  `{title} - S{season:02}E{episode:02} - 第 {episode} 集`、`{title} ({year})`、
+  `{title} - S{season:02}E{episode:02} - 第 {episode} 期`（后两者 v0.9 新增：
+  电影文件名与综艺文件名；Driver 执行细节以手册 §5 为准）。
 - 电影不建 `Season N` 层；综艺的集号语义（期/集）在订阅字段中单独标注。
 - 转存前先盘点目标目录已有集数，只转 `源集号集 − 已有集号集`，不整包重复转存。
 - 同一分享含多个画质子文件夹时，默认选与已有文件规格一致的一版，不混版本；
@@ -230,9 +239,12 @@ Secret 中，不进 D1/代码/日志）。网页端永远看不到 Cookie（明�
 `tg_channels_priority_fallback: true` 标注。
 `directories`（v0.7）：入库目录设置 JSON（结构与校验见 `src/directories.ts`：
 base_dir / tv_dir / movie_dir、三组映射 tv_region_map / tv_special_map /
-movie_category_map、三个命名模板）。无此键时生效值为与用户真实夸克结构一致的
+movie_category_map、命名模板）。无此键时生效值为与用户真实夸克结构一致的
 默认对象；设置页可保存（保存前服务端校验：路径不含首尾斜杠、映射值非空且为
 单层文件夹名、模板含必要占位符，非法返回 400）与恢复默认（删除该键）。
+v0.9 起命名模板为五个：新增 `movie_name_template`（默认 `{title} ({year})`）
+与 `variety_name_template`（默认 `{title} - S{season:02}E{episode:02} - 第 {episode} 期`）；
+旧设置对象缺这两个键时，读取与保存校验都会自动补默认值，不报错。
 `GET /api/driver/config` 与 `GET /api/settings` 都返回生效值；TMDB 选剧回填的
 地区分类也经同一组映射解析（regionForMedia），**分类以 directories 为准**。
 `tmdb_api_key` 由设置页写入（见 §11 已定项 3），读取时只返回末 4 位掩码，完整 Key 不出服务端。
