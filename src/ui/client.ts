@@ -349,7 +349,7 @@ document.addEventListener('keydown', function (e) {
 });
 
 /* ---------- Settings Tabs (v0.8 — keep DOM mounted) ---------- */
-var SETTINGS_TABS = ['account', 'tmdb', 'quark', 'channels', 'directories', 'quality', 'driver'];
+var SETTINGS_TABS = ['account', 'tmdb', 'quark', 'channels', 'directories', 'quality', 'driver', 'wecom'];
 var currentSettingsTab = 'account';
 function switchSettingsTab(name, updateHash) {
   if (SETTINGS_TABS.indexOf(name) < 0) name = 'account';
@@ -1164,6 +1164,7 @@ async function loadSettings() {
   renderChannelSettings(data.settings.tg_channels);
   renderDirectorySettings(data.settings.directories, data.settings.directories_custom);
   renderQualitySettings(data.settings.quality, data.settings.quality_custom);
+  renderWecomSettings(data.settings.wecom);
   renderDashAlerts();
   loadDriverKeys();
 }
@@ -1707,6 +1708,147 @@ document.getElementById('channels-reset').addEventListener('click', async functi
   if (!r.ok) { toast('恢复失败', 'error'); return; }
   document.getElementById('channels-msg').textContent = '已恢复默认清单。';
   toast('已恢复默认频道清单', 'success');
+  loadSettings();
+});
+
+/* ---------- Settings: WeCom ---------- */
+function updateWecomVerifyPreview() {
+  var name = (document.getElementById('wc-verify-name').value || '').trim().replace(/^\/+/, '');
+  var el = document.getElementById('wc-verify-preview');
+  if (!el) return;
+  el.textContent = name ? ('验证访问地址：' + location.origin + '/' + name) : '未填写校验文件（仅启用纯聊天搜剧与主动推送时可暂不填）。';
+}
+function renderWecomSettings(w) {
+  var cbInput = document.getElementById('wc-callback-url');
+  if (cbInput) cbInput.value = location.origin + '/api/wecom/callback';
+  var st = document.getElementById('wecom-status');
+  if (!w) { if (st) st.textContent = '—'; return; }
+  if (!w.enc_configured) {
+    st.innerHTML = '<span class="status-bad">未启用密钥加密</span>';
+  } else if (w.enabled && w.corp_id && w.has_secret) {
+    st.innerHTML = '<span class="status-ok">已启用</span>';
+  } else if (w.corp_id || w.has_secret) {
+    st.innerHTML = '<span class="muted">已配置（未开启）</span>';
+  } else {
+    st.innerHTML = '<span class="muted">未配置</span>';
+  }
+  document.getElementById('wc-enabled').checked = !!w.enabled;
+  document.getElementById('wc-corp-id').value = w.corp_id || '';
+  document.getElementById('wc-agent-id').value = w.agent_id != null ? String(w.agent_id) : '';
+  document.getElementById('wc-proxy-url').value = w.proxy_url || 'https://qywx.ttai.net';
+  document.getElementById('wc-users').value = (w.allowed_users || []).join(', ');
+  document.getElementById('wc-notify').checked = w.notify_enabled !== false;
+  document.getElementById('wc-oauth').checked = w.oauth_enabled !== false;
+  document.getElementById('wc-verify-name').value = w.verify_file_name || '';
+  document.getElementById('wc-verify-content').value = w.verify_file_content || '';
+
+  document.getElementById('wc-secret-hint').textContent = w.has_secret ? ('已加密保存（' + w.secret_masked + '）') : '未配置';
+  document.getElementById('wc-token-hint').textContent = w.has_token ? ('已加密保存（' + w.token_masked + '）') : '未配置';
+  document.getElementById('wc-aes-hint').textContent = w.has_aes_key ? ('已加密保存（' + w.aes_key_masked + '）') : '未配置';
+  updateWecomVerifyPreview();
+}
+document.getElementById('wc-verify-name').addEventListener('input', updateWecomVerifyPreview);
+document.getElementById('wc-copy-cb').addEventListener('click', function () {
+  var inp = document.getElementById('wc-callback-url');
+  inp.select();
+  var ok = function () { toast('回调 URL 已复制到剪贴板', 'success'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(inp.value).then(ok, function () { document.execCommand('copy'); ok(); });
+  } else { document.execCommand('copy'); ok(); }
+});
+document.getElementById('wecom-form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  var btn = document.getElementById('wc-save');
+  var msg = document.getElementById('wecom-msg');
+  var agentVal = document.getElementById('wc-agent-id').value.trim();
+  var payload = {
+    enabled: document.getElementById('wc-enabled').checked,
+    corp_id: document.getElementById('wc-corp-id').value.trim(),
+    agent_id: agentVal ? Number(agentVal) : null,
+    proxy_url: document.getElementById('wc-proxy-url').value.trim() || 'https://qywx.ttai.net',
+    allowed_users: document.getElementById('wc-users').value.trim(),
+    notify_enabled: document.getElementById('wc-notify').checked,
+    oauth_enabled: document.getElementById('wc-oauth').checked,
+    verify_file_name: document.getElementById('wc-verify-name').value.trim(),
+    verify_file_content: document.getElementById('wc-verify-content').value.trim()
+  };
+  var sec = document.getElementById('wc-secret').value.trim();
+  var tok = document.getElementById('wc-token').value.trim();
+  var aes = document.getElementById('wc-aes-key').value.trim();
+  if (sec) payload.secret = sec;
+  if (tok) payload.token = tok;
+  if (aes) payload.encoding_aes_key = aes;
+
+  setBtnLoading(btn, true);
+  try {
+    var r = await api('/api/settings', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ wecom: payload })
+    });
+    var data = await r.json().catch(function () { return null; });
+    if (!r.ok) {
+      var errText = data && data.error ? data.error.message : '保存失败';
+      msg.textContent = errText; toast(errText, 'error'); return;
+    }
+    document.getElementById('wc-secret').value = '';
+    document.getElementById('wc-token').value = '';
+    document.getElementById('wc-aes-key').value = '';
+    msg.textContent = '企业微信配置已保存。';
+    toast('企业微信配置已保存', 'success');
+    loadSettings();
+  } finally {
+    setBtnLoading(btn, false);
+  }
+});
+document.getElementById('wc-sync-menu').addEventListener('click', async function () {
+  var btn = this;
+  var msg = document.getElementById('wecom-msg');
+  setBtnLoading(btn, true);
+  try {
+    var r = await api('/api/wecom/menu/sync', { method: 'POST' });
+    var data = await r.json().catch(function () { return null; });
+    if (!r.ok) {
+      var errText = data && data.error ? data.error.message : '菜单同步失败';
+      msg.textContent = errText; toast(errText, 'error'); return;
+    }
+    msg.textContent = '自定义菜单已下发到企业微信（重新打开应用会话即可看到最新菜单）。';
+    toast('自定义菜单同步成功', 'success');
+  } finally {
+    setBtnLoading(btn, false);
+  }
+});
+document.getElementById('wc-test').addEventListener('click', async function () {
+  var btn = this;
+  var msg = document.getElementById('wecom-msg');
+  setBtnLoading(btn, true);
+  try {
+    var r = await api('/api/wecom/test', { method: 'POST' });
+    var data = await r.json().catch(function () { return null; });
+    if (!r.ok) {
+      var errText = data && data.error ? data.error.message : '测试发送失败';
+      msg.textContent = errText; toast(errText, 'error'); return;
+    }
+    msg.textContent = '测试消息已发送至：' + (data && data.target ? data.target : '全部成员');
+    toast('测试消息已发送', 'success');
+  } finally {
+    setBtnLoading(btn, false);
+  }
+});
+document.getElementById('wc-clear-secrets').addEventListener('click', async function () {
+  var ok = await confirmDialog({
+    title: '清除企业微信密钥',
+    message: '确定清除已保存的应用 Secret、回调 Token 和 EncodingAESKey 吗？清除后回调验签与推送将暂停。',
+    confirmText: '确认清除',
+    danger: true
+  });
+  if (!ok) return;
+  var r = await api('/api/settings', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clear_wecom_secrets: true })
+  });
+  if (!r.ok) { toast('清除失败', 'error'); return; }
+  document.getElementById('wecom-msg').textContent = '已清除企业微信加密密钥。';
+  toast('已清除企业微信密钥', 'info');
   loadSettings();
 });
 

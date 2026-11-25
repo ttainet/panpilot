@@ -4,6 +4,7 @@ import {
   ICON_ARROW_RIGHT,
   ICON_BRAND,
   ICON_CLOSE,
+  ICON_COPY,
   ICON_DASH,
   ICON_FILM,
   ICON_FIND,
@@ -283,6 +284,7 @@ export function appHtml(initialView: string): string {
           <button type="button" class="settings-tab" data-stab="directories" role="tab">入库目录</button>
           <button type="button" class="settings-tab" data-stab="quality" role="tab">画质偏好</button>
           <button type="button" class="settings-tab" data-stab="driver" role="tab">Driver</button>
+          <button type="button" class="settings-tab" data-stab="wecom" role="tab">企业微信</button>
         </div>
 
         <div class="settings-panel" id="spanel-account">
@@ -580,6 +582,118 @@ export function appHtml(initialView: string): string {
             </div>
             <p class="section-desc" style="margin-bottom:0">Driver 默认检查间隔为 <strong id="interval">…</strong> 小时一轮（由 Worker 环境变量 <code>CHECK_INTERVAL_HOURS</code> 控制）。Driver API Key 与网页端登录会话完全隔离。</p>
           </div>
+        </div>
+
+        <div class="settings-panel" id="spanel-wecom">
+          <form id="wecom-form">
+            <div class="card">
+              <div class="card-head">
+                <h2>企业微信自建应用</h2>
+                <span class="status-pill-box" id="wecom-status">加载中…</span>
+              </div>
+              <p class="section-desc">在微信内直接发片名搜剧、回复序号订阅（默认自动转存）、接收新集入库/Cookie 失效提醒，并通过自定义菜单免密打开移动控制台。所有密钥均使用 <code>COOKIE_ENC_SECRET</code> 进行 <strong>AES-GCM 加密</strong>保存，页面只展示掩码。</p>
+
+              <div class="field" style="margin-bottom:.95rem">
+                <label class="switch-row" for="wc-enabled">
+                  <div class="switch-text">
+                    <div class="switch-title">启用企业微信联动</div>
+                    <div class="switch-desc">开启后处理回调消息、自动回复搜剧结果并启用自定义菜单/主动推送</div>
+                  </div>
+                  <span class="switch"><input type="checkbox" id="wc-enabled"><span class="switch-track"></span></span>
+                </label>
+              </div>
+
+              <div class="field" style="margin-bottom:.95rem">
+                <label class="field-label" for="wc-callback-url">接收消息服务器 URL（填入企业微信后台「接收消息 → 设置 API 接收」）</label>
+                <div class="input-group">
+                  <input id="wc-callback-url" readonly autocomplete="off" style="font-family:var(--pp-mono);font-size:.84rem">
+                  <button type="button" class="btn" id="wc-copy-cb">${ICON_COPY}<span>复制地址</span></button>
+                </div>
+              </div>
+
+              <div class="form-grid-2">
+                <div class="field">
+                  <label class="field-label" for="wc-corp-id">企业 ID（CorpID）</label>
+                  <input id="wc-corp-id" placeholder="如 wwxxxxxxxxxxxxxxxx" autocomplete="off">
+                </div>
+                <div class="field">
+                  <label class="field-label" for="wc-agent-id">应用 AgentId</label>
+                  <input id="wc-agent-id" type="number" min="1" placeholder="如 1000002" autocomplete="off">
+                </div>
+                <div class="field">
+                  <label class="field-label" for="wc-proxy-url">企微 API 代理地址（固定出口 IP 用）</label>
+                  <input id="wc-proxy-url" placeholder="https://qywx.ttai.net" autocomplete="off">
+                  <span class="field-hint">已预设你的 VPS 代理 <code>https://qywx.ttai.net</code>（对应可信 IP：<code>94.241.161.18</code>）</span>
+                </div>
+                <div class="field">
+                  <label class="field-label" for="wc-users">允许的 UserID 白名单（必填，用于权限控制与免密登录）</label>
+                  <input id="wc-users" placeholder="如 ZhangSan，多个用英文逗号分隔" autocomplete="off">
+                  <span class="field-hint">在企业微信管理后台「通讯录 → 成员详情 → 账号」查看 UserID</span>
+                </div>
+              </div>
+
+              <div class="form-grid-3" style="margin-top:.9rem">
+                <div class="field">
+                  <label class="field-label" for="wc-secret">应用 Secret（不改可留空）</label>
+                  <input id="wc-secret" type="password" placeholder="粘贴应用 Secret" autocomplete="off">
+                  <span class="field-hint" id="wc-secret-hint">未配置</span>
+                </div>
+                <div class="field">
+                  <label class="field-label" for="wc-token">回调 Token（不改可留空）</label>
+                  <input id="wc-token" type="password" placeholder="后台随机生成后粘贴" autocomplete="off">
+                  <span class="field-hint" id="wc-token-hint">未配置</span>
+                </div>
+                <div class="field">
+                  <label class="field-label" for="wc-aes-key">EncodingAESKey（不改可留空）</label>
+                  <input id="wc-aes-key" type="password" placeholder="43 位 Base64 字符" autocomplete="off">
+                  <span class="field-hint" id="wc-aes-hint">未配置</span>
+                </div>
+              </div>
+
+              <div class="form-grid-2" style="margin-top:.9rem">
+                <label class="switch-row" for="wc-notify">
+                  <div class="switch-text">
+                    <div class="switch-title">主动微信推送通知</div>
+                    <div class="switch-desc">新集入库、剧集完结、订阅异常与夸克 Cookie 失效时自动提醒</div>
+                  </div>
+                  <span class="switch"><input type="checkbox" id="wc-notify"><span class="switch-track"></span></span>
+                </label>
+                <label class="switch-row" for="wc-oauth">
+                  <div class="switch-text">
+                    <div class="switch-title">微信内免密打开控制台</div>
+                    <div class="switch-desc">点击菜单网页入口时走企微 OAuth2 校验白名单 UserID 免密登录</div>
+                  </div>
+                  <span class="switch"><input type="checkbox" id="wc-oauth"><span class="switch-track"></span></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2>可信域名校验文件（OAuth2 免密登录需要）</h2>
+              </div>
+              <p class="section-desc">在企业微信「网页授权及 JS-SDK → 设置可信域名」下载 <code>WW_verify_xxx.txt</code> 后把文件名与内容填入此处保存，PanPilot 会自动在根目录对外提供验证。</p>
+              <div class="form-grid-2">
+                <div class="field">
+                  <label class="field-label" for="wc-verify-name">校验文件名</label>
+                  <input id="wc-verify-name" placeholder="如 WW_verify_AbCdEfGh.txt" autocomplete="off">
+                </div>
+                <div class="field">
+                  <label class="field-label" for="wc-verify-content">校验文件内容</label>
+                  <input id="wc-verify-content" placeholder="粘贴文件内的一行校验字符串" autocomplete="off">
+                </div>
+              </div>
+              <p class="muted" id="wc-verify-preview" style="margin-top:.6rem"></p>
+
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary" id="wc-save">保存企业微信配置</button>
+                <button type="button" class="btn" id="wc-sync-menu">一键同步自定义菜单</button>
+                <button type="button" class="btn" id="wc-test">发送测试消息</button>
+                <button type="button" class="btn btn-danger" id="wc-clear-secrets">清除已存密钥</button>
+              </div>
+              <p id="wecom-msg" class="muted" style="margin-top:.65rem"></p>
+            </div>
+          </form>
         </div>
       </section>
     </main>

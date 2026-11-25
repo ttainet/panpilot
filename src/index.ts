@@ -131,6 +131,22 @@ import { AI_DRIVER_GUIDE_MD } from "./guide";
 import { DEFAULT_TG_CHANNELS, PRIORITY_TG_CHANNELS } from "./channels";
 import { loginHtml } from "./ui/login";
 import { appHtml } from "./ui/app";
+import {
+  buildWecomOAuthUrl,
+  clearWecomTokenCache,
+  exchangeWecomOAuthCode,
+  extractXmlTag,
+  maskSecret,
+  resolveWecomConfig,
+  sendWecomNews,
+  sendWecomText,
+  syncWecomMenu,
+  validateWecomConfig,
+  verifyWecomSignature,
+  wecomDecrypt,
+  type WecomPublicConfig,
+  type WecomSecrets,
+} from "./wecom";
 
 export interface Env {
   DB?: D1Database;
@@ -1389,7 +1405,7 @@ async function handleDriverCandidates(req: Request, store: Store): Promise<Respo
 }
 
 /** POST /api/driver/progress — write back episode progress / subscription status. */
-async function handleDriverProgress(req: Request, store: Store, env: Env): Promise<Response> {
+async function handleDriverProgress(req: Request, store: Store, env: Env, ctx?: ExecutionContext): Promise<Response> {
   const input = await body<{
     task_id?: string;
     episodes?: EpisodeProgressInput[];
@@ -1420,6 +1436,13 @@ async function handleDriverProgress(req: Request, store: Store, env: Env): Promi
   // A progress report that reaches a terminal subscription state closes the task.
   if (input.subscription_status && ["partial_stored", "completed", "ended", "error"].includes(input.subscription_status)) {
     await store.updateTask(task.id, { status: input.subscription_status === "error" ? "failed" : "done" });
+  }
+  const storedEps = (input.episodes ?? []).filter((e) => e.status === "stored");
+  const importantStatus = input.subscription_status === "completed"
+    || input.subscription_status === "ended"
+    || input.subscription_status === "error";
+  if (storedEps.length > 0 || importantStatus) {
+    runBg(ctx, notifyWecomProgress(store, env, task.subscription_id, storedEps, input.subscription_status, input.note));
   }
   return json({ ok: true });
 }
@@ -1627,6 +1650,7 @@ async function handleGetSettings(store: Store, env: Env): Promise<Response> {
   const directoriesCustom = (await store.getSetting(SETTING_DIRECTORIES)) != null;
   const quality = await getEffectiveQuality(store);
   const qualityCustom = (await store.getSetting(SETTING_QUALITY)) != null;
+  const wecom = await getWecomSettingsView(store, env);
   return json({
     settings: {
       tmdb_api_key: { configured: !!key, masked: key ? maskKey(key) : null },
@@ -1658,6 +1682,8 @@ async function handleGetSettings(store: Store, env: Env): Promise<Response> {
       // v1.0: effective global quality profile (defaults when not customised).
       quality,
       quality_custom: qualityCustom,
+      // Enterprise WeChat (WeCom) integration settings (secrets masked only).
+      wecom,
     },
   });
 }
@@ -1735,6 +1761,8 @@ async function handleUpdateSettings(req: Request, store: Store, env: Env): Promi
     reset_directories?: boolean;
     quality?: unknown;
     reset_quality?: boolean;
+    wecom?: unknown;
+    clear_wecom_secrets?: boolean;
   }>(req);
   if (!input) return err("bad_request", "invalid JSON body", 400);
   let changed = false;
@@ -1754,6 +1782,31 @@ async function handleUpdateSettings(req: Request, store: Store, env: Env): Promi
     const v = validateQuality(input.quality);
     if (!v.value) return err("bad_request", `画质偏好不合法：${v.error ?? "unknown error"}`, 400);
     qualityToSave = v.value;
+  }
+
+  // --- WeCom config & encrypted secrets: validate up-front. ---
+  let wecomCfgToSave: WecomPublicConfig | null = null;
+  let wecomSecretsInput: { secret?: string; token?: string; encoding_aes_key?: string } | null = null;
+  if (input.wecom !== undefined) {
+    if (!input.wecom || typeof input.wecom !== "object") {
+      return err("bad_request", "企业微信配置格式不正确", 400);
+    }
+    const wObj = input.wecom as Record<string, unknown>;
+    const v = validateWecomConfig(wObj);
+    if (!v.value) return err("bad_request", `企业微信设置不合法：${v.error ?? "unknown error"}`, 400);
+    wecomCfgToSave = v.value;
+    const sec = typeof wObj.secret === "string" ? wObj.secret.trim() : "";
+    const tok = typeof wObj.token === "string" ? wObj.token.trim() : "";
+    const aes = typeof wObj.encoding_aes_key === "string" ? wObj.encoding_aes_key.trim() : "";
+    if (aes && !/^[A-Za-z0-9+/]{43}$/.test(aes)) {
+      return err("bad_request", "EncodingAESKey 必须为 43 位 Base64 字符", 400);
+    }
+    if (sec || tok || aes) {
+      wecomSecretsInput = {};
+      if (sec) wecomSecretsInput.secret = sec;
+      if (tok) wecomSecretsInput.token = tok;
+      if (aes) wecomSecretsInput.encoding_aes_key = aes;
+    }
   }
 
   if (input.clear_tmdb_api_key) {
@@ -1846,8 +1899,39 @@ async function handleUpdateSettings(req: Request, store: Store, env: Env): Promi
     changed = true;
   }
 
+  // --- WeCom config & encrypted secrets ---
+  if (input.clear_wecom_secrets) {
+    await store.deleteSetting(SETTING_WECOM_SECRETS_ENC);
+    await clearWecomTokenCache(store);
+    await store.addLog({ level: "info", event: "wecom_secrets_cleared" });
+    changed = true;
+  }
+  if (wecomCfgToSave) {
+    if (wecomSecretsInput) {
+      const key = await cookieEncKey(env);
+      if (!key) {
+        return err(
+          "cookie_enc_not_configured",
+          "服务端未配置 COOKIE_ENC_SECRET，无法加密保存企业微信密钥。",
+          400,
+        );
+      }
+      const existing = await getWecomSecretsPlain(store, env);
+      const merged: WecomSecrets = { ...existing, ...wecomSecretsInput };
+      const enc = await encryptText(key, JSON.stringify(merged));
+      await store.setSetting(SETTING_WECOM_SECRETS_ENC, JSON.stringify(enc));
+    }
+    await store.setSetting(SETTING_WECOM_CONFIG, JSON.stringify(wecomCfgToSave));
+    await clearWecomTokenCache(store);
+    await store.addLog({
+      level: "info", event: "wecom_config_saved",
+      detail: JSON.stringify({ enabled: wecomCfgToSave.enabled, has_secrets_update: !!wecomSecretsInput }),
+    });
+    changed = true;
+  }
+
   if (!changed) {
-    return err("bad_request", "nothing to update: provide tmdb_api_key / quark_cookie / tg_channels / tg_channels_priority_only / directories / quality (or the clear/reset flags)", 400);
+    return err("bad_request", "nothing to update: provide tmdb_api_key / quark_cookie / tg_channels / tg_channels_priority_only / directories / quality / wecom (or clear/reset flags)", 400);
   }
   return handleGetSettings(store, env);
 }
@@ -2067,7 +2151,7 @@ function handleDriverAgentGuide(): Response {
 }
 
 /** POST /api/driver/quark-status — Driver reports whether the cookie still works. */
-async function handleDriverQuarkStatus(req: Request, store: Store): Promise<Response> {
+async function handleDriverQuarkStatus(req: Request, store: Store, env: Env, ctx?: ExecutionContext): Promise<Response> {
   const input = await body<{ status?: string; note?: string; driver_id?: string }>(req);
   if (!input || (input.status !== "ok" && input.status !== "invalid")) {
     return err("bad_request", 'status must be "ok" or "invalid"', 400);
@@ -2080,6 +2164,10 @@ async function handleDriverQuarkStatus(req: Request, store: Store): Promise<Resp
     event: "quark_cookie_status",
     detail: JSON.stringify({ status: input.status, note: typeof input.note === "string" ? input.note.slice(0, 200) : undefined }),
   });
+  if (input.status === "invalid") {
+    const noteText = typeof input.note === "string" && input.note.trim() ? `\n原因：${input.note.trim().slice(0, 120)}` : "";
+    runBg(ctx, notifyWecomText(store, env, `⚠️ PanPilot 夸克 Cookie 已失效${noteText}\n请打开控制台「设置 → 网盘」粘贴最新 Cookie。`));
+  }
   return json({ ok: true });
 }
 
@@ -2127,14 +2215,51 @@ async function tmdbFetch(store: Store, path: string): Promise<TmdbFetchResult> {
 const tmdbPoster = (p: unknown): string | undefined =>
   typeof p === "string" && p ? `https://image.tmdb.org/t/p/w342${p}` : undefined;
 
-/** GET /api/tmdb/search?q=... — multi search (tv + movie), zh-CN. */
-async function handleTmdbSearch(url: URL, store: Store): Promise<Response> {
-  const q = url.searchParams.get("q")?.trim();
-  if (!q) return err("bad_request", "q is required", 400);
+interface TmdbSearchItem {
+  tmdb_id: number;
+  media_type: MediaType;
+  title: string;
+  original_title: string;
+  year?: number;
+  origin_country: string[];
+  region?: string;
+  poster_url?: string;
+  poster_path?: string;
+  rating?: number;
+  overview?: string;
+}
+
+interface TmdbSeasonInfo {
+  season: number;
+  episode_count: number;
+  name?: string;
+}
+
+interface TmdbDetailItem extends TmdbSearchItem {
+  genres: string[];
+  status?: string;
+  number_of_seasons?: number;
+  number_of_episodes?: number;
+  seasons?: TmdbSeasonInfo[];
+  runtime?: number;
+}
+
+async function searchTmdbItems(
+  store: Store,
+  q: string,
+): Promise<{ results?: TmdbSearchItem[]; errorCode?: string; errorMessage?: string; errorResponse?: Response }> {
   const { data, errorResponse } = await tmdbFetch(store, `/search/multi?query=${encodeURIComponent(q)}&include_adult=false&page=1`);
-  if (errorResponse) return errorResponse;
+  if (errorResponse) {
+    const cloned = errorResponse.clone();
+    const errJson = (await cloned.json().catch(() => null)) as { error?: { code?: string; message?: string } } | null;
+    return {
+      errorResponse,
+      errorCode: errJson?.error?.code,
+      errorMessage: errJson?.error?.message,
+    };
+  }
   const dirs = await getEffectiveDirectories(store);
-  const results = ((data as { results?: unknown[] }).results ?? [])
+  const results: TmdbSearchItem[] = ((data as { results?: unknown[] }).results ?? [])
     .filter((r): r is Row => typeof r === "object" && r !== null && (r as Row).media_type !== "person"
       && ((r as Row).media_type === "tv" || (r as Row).media_type === "movie"))
     .map((r) => {
@@ -2156,18 +2281,20 @@ async function handleTmdbSearch(url: URL, store: Store): Promise<Response> {
         overview: typeof r.overview === "string" ? r.overview : undefined,
       };
     });
-  return json({ results });
+  return { results };
 }
 
-/** GET /api/tmdb/details?type=tv|movie&id=... — seasons/episodes for tv. */
-async function handleTmdbDetails(url: URL, store: Store): Promise<Response> {
-  const type = url.searchParams.get("type");
-  const id = url.searchParams.get("id");
-  if ((type !== "tv" && type !== "movie") || !id || !/^\d+$/.test(id)) {
-    return err("bad_request", "type (tv|movie) and numeric id are required", 400);
-  }
+async function getTmdbItemDetails(
+  store: Store,
+  type: "tv" | "movie",
+  id: string,
+): Promise<{ details?: TmdbDetailItem; errorMessage?: string; errorResponse?: Response }> {
   const { data, errorResponse } = await tmdbFetch(store, `/${type}/${id}`);
-  if (errorResponse) return errorResponse;
+  if (errorResponse) {
+    const cloned = errorResponse.clone();
+    const errJson = (await cloned.json().catch(() => null)) as { error?: { message?: string } } | null;
+    return { errorResponse, errorMessage: errJson?.error?.message };
+  }
   const r = data as Row;
   const countries = Array.isArray(r.origin_country) ? (r.origin_country as unknown[]).map(String) : [];
   const dateStr = String((type === "tv" ? r.first_air_date : r.release_date) ?? "");
@@ -2191,26 +2318,707 @@ async function handleTmdbDetails(url: URL, store: Store): Promise<Response> {
     status: typeof r.status === "string" ? r.status : undefined,
   };
   if (type === "tv") {
-    const seasons = (Array.isArray(r.seasons) ? (r.seasons as Row[]) : []).map((s) => ({
+    const seasons: TmdbSeasonInfo[] = (Array.isArray(r.seasons) ? (r.seasons as Row[]) : []).map((s) => ({
       season: Number(s.season_number),
       episode_count: Number(s.episode_count),
       name: typeof s.name === "string" ? s.name : undefined,
     }));
-    return json({
+    return {
       details: {
         ...base,
         number_of_seasons: typeof r.number_of_seasons === "number" ? r.number_of_seasons : undefined,
         number_of_episodes: typeof r.number_of_episodes === "number" ? r.number_of_episodes : undefined,
         seasons,
       },
-    });
+    };
   }
-  return json({
+  return {
     details: {
       ...base,
       runtime: typeof r.runtime === "number" ? r.runtime : undefined,
     },
+  };
+}
+
+/** GET /api/tmdb/search?q=... — multi search (tv + movie), zh-CN. */
+async function handleTmdbSearch(url: URL, store: Store): Promise<Response> {
+  const q = url.searchParams.get("q")?.trim();
+  if (!q) return err("bad_request", "q is required", 400);
+  const { results, errorResponse } = await searchTmdbItems(store, q);
+  if (errorResponse) return errorResponse;
+  return json({ results });
+}
+
+/** GET /api/tmdb/details?type=tv|movie&id=... — seasons/episodes for tv. */
+async function handleTmdbDetails(url: URL, store: Store): Promise<Response> {
+  const type = url.searchParams.get("type");
+  const id = url.searchParams.get("id");
+  if ((type !== "tv" && type !== "movie") || !id || !/^\d+$/.test(id)) {
+    return err("bad_request", "type (tv|movie) and numeric id are required", 400);
+  }
+  const { details, errorResponse } = await getTmdbItemDetails(store, type, id);
+  if (errorResponse) return errorResponse;
+  return json({ details });
+}
+
+// ---------------------------------------------------------------------------
+// Enterprise WeChat (WeCom / 企业微信自建应用) Integration
+// ---------------------------------------------------------------------------
+
+const SETTING_WECOM_CONFIG = "wecom_config";
+const SETTING_WECOM_SECRETS_ENC = "wecom_secrets_enc";
+const SETTING_WECOM_DEDUP = "wecom_dedup";
+const WECOM_SESSION_PREFIX = "wecom_session:";
+const WECOM_SESSION_TTL = 600;
+
+const WECOM_STATUS_ZH: Record<SubStatus, string> = {
+  subscribed: "已订阅",
+  pending_search: "待搜索",
+  searching: "搜索中",
+  candidates_ready: "已找到候选",
+  awaiting_confirm: "待确认",
+  transferring: "转存中",
+  verifying: "复核中",
+  partial_stored: "部分入库",
+  completed: "已集齐",
+  ended: "已完结",
+  paused: "已暂停",
+  error: "出错",
+};
+
+function runBg(ctx: ExecutionContext | undefined, promise: Promise<unknown>): void {
+  const safe = promise.catch(() => {});
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(safe);
+  }
+}
+
+async function getWecomConfig(store: Store): Promise<WecomPublicConfig> {
+  return resolveWecomConfig(await store.getSetting(SETTING_WECOM_CONFIG));
+}
+
+async function getWecomSecretsPlain(store: Store, env: Env): Promise<WecomSecrets> {
+  const raw = await store.getSetting(SETTING_WECOM_SECRETS_ENC);
+  if (!raw) return {};
+  const key = await cookieEncKey(env);
+  if (!key) return {};
+  try {
+    const pt = await decryptText(key, JSON.parse(raw) as { iv: string; ct: string });
+    if (!pt) return {};
+    const parsed = JSON.parse(pt) as WecomSecrets;
+    return {
+      secret: typeof parsed.secret === "string" ? parsed.secret : undefined,
+      token: typeof parsed.token === "string" ? parsed.token : undefined,
+      encoding_aes_key: typeof parsed.encoding_aes_key === "string" ? parsed.encoding_aes_key : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+async function getWecomSettingsView(store: Store, env: Env) {
+  const cfg = await getWecomConfig(store);
+  const sec = await getWecomSecretsPlain(store, env);
+  return {
+    ...cfg,
+    enc_configured: !!(await cookieEncKey(env)),
+    has_secret: !!sec.secret,
+    secret_masked: maskSecret(sec.secret),
+    has_token: !!sec.token,
+    token_masked: maskSecret(sec.token),
+    has_aes_key: !!sec.encoding_aes_key,
+    aes_key_masked: maskSecret(sec.encoding_aes_key),
+  };
+}
+
+function wecomNotifyTarget(cfg: WecomPublicConfig): string {
+  return cfg.allowed_users.length > 0 ? cfg.allowed_users.join("|") : "@all";
+}
+
+async function notifyWecomText(store: Store, env: Env, text: string): Promise<void> {
+  try {
+    const cfg = await getWecomConfig(store);
+    if (!cfg.enabled || !cfg.notify_enabled || !cfg.corp_id || !cfg.agent_id) return;
+    const secrets = await getWecomSecretsPlain(store, env);
+    if (!secrets.secret) return;
+    await sendWecomText(store, cfg, secrets, wecomNotifyTarget(cfg), text);
+  } catch (e) {
+    await store.addLog({
+      level: "warn",
+      event: "wecom_notify_failed",
+      detail: e instanceof Error ? e.message.slice(0, 300) : String(e),
+    });
+  }
+}
+
+async function notifyWecomProgress(
+  store: Store,
+  env: Env,
+  subscriptionId: string,
+  storedEps: EpisodeProgressInput[],
+  subStatus?: SubStatus,
+  note?: string,
+): Promise<void> {
+  const sub = await store.getSubscription(subscriptionId);
+  if (!sub) return;
+  const seasonLabel = sub.season != null && sub.media_type !== "movie" ? ` 第 ${sub.season} 季` : "";
+  const statusText = subStatus ? (WECOM_STATUS_ZH[subStatus] ?? subStatus) : (WECOM_STATUS_ZH[sub.status] ?? sub.status);
+  if (subStatus === "error") {
+    const reason = note ? `\n原因：${note.slice(0, 160)}` : "";
+    await notifyWecomText(store, env, `❌ 订阅异常：《${sub.title}》${seasonLabel}${reason}`);
+    return;
+  }
+  const epNums = storedEps.map((e) => e.episode).filter((n) => Number.isFinite(n)).sort((a, b) => a - b);
+  const epDesc = epNums.length > 0
+    ? (epNums.length === 1 ? `第 ${epNums[0]} 集` : `第 ${epNums[0]}–${epNums[epNums.length - 1]} 集（共 ${epNums.length} 集）`)
+    : "";
+  if (subStatus === "completed" || subStatus === "ended") {
+    const extra = epDesc ? `\n本次入库：${epDesc}` : "";
+    await notifyWecomText(store, env, `🎉 订阅${statusText}：《${sub.title}》${seasonLabel}${extra}`);
+    return;
+  }
+  if (epDesc) {
+    await notifyWecomText(store, env, `✅ 新集入库：《${sub.title}》${seasonLabel}\n本次入库：${epDesc}\n当前状态：${statusText}`);
+  }
+}
+
+async function isDuplicateWecomMsg(store: Store, msgId: string): Promise<boolean> {
+  if (!msgId) return false;
+  const t = now();
+  let entries: [string, number][] = [];
+  const raw = await store.getSetting(SETTING_WECOM_DEDUP);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) {
+        entries = parsed.filter(
+          (x): x is [string, number] => Array.isArray(x) && typeof x[0] === "string" && typeof x[1] === "number" && t - x[1] < 300,
+        );
+      }
+    } catch { /* ignore */ }
+  }
+  if (entries.some(([id]) => id === msgId)) return true;
+  entries.push([msgId, t]);
+  if (entries.length > 50) entries = entries.slice(-50);
+  await store.setSetting(SETTING_WECOM_DEDUP, JSON.stringify(entries));
+  return false;
+}
+
+interface WecomDialogSession {
+  step: "pick_media" | "pick_season";
+  expires_at: number;
+  items?: TmdbSearchItem[];
+  item?: TmdbDetailItem;
+}
+
+async function loadWecomSession(store: Store, userId: string): Promise<WecomDialogSession | null> {
+  const raw = await store.getSetting(`${WECOM_SESSION_PREFIX}${userId}`);
+  if (!raw) return null;
+  try {
+    const s = JSON.parse(raw) as WecomDialogSession;
+    if (!s || typeof s.expires_at !== "number" || s.expires_at < now()) {
+      await store.deleteSetting(`${WECOM_SESSION_PREFIX}${userId}`);
+      return null;
+    }
+    return s;
+  } catch {
+    return null;
+  }
+}
+
+async function saveWecomSession(store: Store, userId: string, session: WecomDialogSession): Promise<void> {
+  await store.setSetting(`${WECOM_SESSION_PREFIX}${userId}`, JSON.stringify(session));
+}
+
+async function clearWecomSession(store: Store, userId: string): Promise<void> {
+  await store.deleteSetting(`${WECOM_SESSION_PREFIX}${userId}`);
+}
+
+async function formatWecomSubsReply(store: Store, group: "active" | "finished"): Promise<string> {
+  const subs = await store.listSubscriptions();
+  const counts = await store.getStoredCounts();
+  const filtered = subs.filter((s) => group === "finished" ? FINISHED_STATUSES.includes(s.status) : !FINISHED_STATUSES.includes(s.status));
+  if (!filtered.length) {
+    return group === "finished" ? "暂无已完成的订阅。" : "暂无追更中的订阅，直接发送剧名即可搜索添加。";
+  }
+  const lines = filtered.slice(0, 12).map((s, idx) => {
+    const stored = storedForSub(counts, s);
+    const prog = s.media_type === "movie"
+      ? (stored > 0 ? "已入库" : "未入库")
+      : `${stored}/${s.total_episodes ?? "?"}集`;
+    const season = s.season != null && s.media_type !== "movie" ? ` S${String(s.season).padStart(2, "0")}` : "";
+    return `${idx + 1}. 《${s.title}》${season} · ${prog} · ${WECOM_STATUS_ZH[s.status] ?? s.status}`;
   });
+  const header = group === "finished" ? `✅ 已完成订阅（共 ${filtered.length} 部）：` : `📺 追更中订阅（共 ${filtered.length} 部）：`;
+  const tail = filtered.length > 12 ? `\n…仅展示前 12 条，更多请在菜单「打开控制台」查看` : "";
+  return `${header}\n${lines.join("\n")}${tail}`;
+}
+
+async function formatWecomStatusReply(store: Store, env: Env): Promise<string> {
+  const subs = await store.listSubscriptions();
+  const counts = await store.getStoredCounts();
+  let storedTotal = 0;
+  for (const s of subs) storedTotal += storedForSub(counts, s);
+  const finished = subs.filter((s) => FINISHED_STATUSES.includes(s.status)).length;
+  const following = subs.length - finished;
+  const errCount = subs.filter((s) => s.status === "error").length;
+  const tmdbOk = !!(await getTmdbApiKey(store));
+  const encOk = !!(await cookieEncKey(env));
+  const cookie = await getQuarkCookieMeta(store, env);
+  const cookieText = !encOk
+    ? "未启用加密"
+    : !cookie.configured
+      ? "未配置"
+      : cookie.driver_status === "invalid"
+        ? "已失效 ⚠️"
+        : cookie.driver_status === "ok"
+          ? "有效 ✅"
+          : "已配置（待验证）";
+  return [
+    "📊 PanPilot 运行概览",
+    `• 订阅总数：${subs.length}（追更中 ${following} / 已完成 ${finished}${errCount ? ` / 异常 ${errCount}` : ""}）`,
+    `• 累计入库：${storedTotal} 集`,
+    `• TMDB 搜索：${tmdbOk ? "已配置 ✅" : "未配置 ⚠️"}`,
+    `• 夸克 Cookie：${cookieText}`,
+  ].join("\n");
+}
+
+async function formatWecomLogsReply(store: Store): Promise<string> {
+  const logs = await store.listLogs({ limit: 6 });
+  if (!logs.length) return "暂无操作日志。";
+  const lines = logs.map((l) => {
+    const title = l.subscription_title ? `《${l.subscription_title}》` : "系统";
+    const lv = l.level === "error" ? "❌" : (l.level === "warn" ? "⚠️" : "ℹ️");
+    return `${lv} ${title} · ${l.event}`;
+  });
+  return `🧾 最近操作日志：\n${lines.join("\n")}`;
+}
+
+async function subscribeFromWecom(
+  store: Store,
+  cfg: WecomPublicConfig,
+  secrets: WecomSecrets,
+  fromUser: string,
+  originUrl: string,
+  details: TmdbDetailItem,
+  season?: number,
+  totalEpisodes?: number,
+): Promise<void> {
+  const existing = (await store.listSubscriptions()).find((s) =>
+    s.tmdb_id === details.tmdb_id
+    && s.media_type === details.media_type
+    && (details.media_type === "movie" || s.season === season),
+  );
+  if (existing) {
+    const seasonText = season != null && details.media_type !== "movie" ? ` 第 ${season} 季` : "";
+    await sendWecomText(
+      store, cfg, secrets, fromUser,
+      `ℹ️ 《${details.title}》${seasonText}已在订阅列表中（当前状态：${WECOM_STATUS_ZH[existing.status] ?? existing.status}）。`,
+    );
+    return;
+  }
+  const t = now();
+  const sub: Subscription = {
+    id: uid(),
+    title: details.title,
+    original_title: details.original_title || undefined,
+    year: details.year,
+    tmdb_id: details.tmdb_id,
+    media_type: details.media_type,
+    region: details.region || undefined,
+    season: details.media_type === "movie" ? undefined : season,
+    total_episodes: details.media_type === "movie" ? undefined : totalEpisodes,
+    poster_path: details.poster_path,
+    overview: details.overview,
+    rating: details.rating,
+    mode: "auto",
+    status: "pending_search",
+    next_check_at: t,
+    created_at: t,
+    updated_at: t,
+  };
+  await store.createSubscription(sub);
+  await store.addLog({
+    subscription_id: sub.id,
+    level: "info",
+    event: "wecom_subscribed",
+    detail: JSON.stringify({ user: fromUser, title: sub.title, season: sub.season, mode: sub.mode }),
+  });
+
+  const seasonLabel = sub.season != null && sub.media_type !== "movie"
+    ? `第 ${sub.season} 季${sub.total_episodes ? `（共 ${sub.total_episodes} 集）` : ""}`
+    : (sub.media_type === "movie" ? "电影" : "剧集");
+  const descParts = [
+    sub.year ? String(sub.year) : "",
+    sub.region || "",
+    seasonLabel,
+    sub.rating ? `★${sub.rating.toFixed(1)}` : "",
+    "模式：自动转存",
+  ].filter(Boolean);
+  const cardUrl = buildWecomOAuthUrl(cfg, originUrl, "/subscriptions");
+  try {
+    await sendWecomNews(store, cfg, secrets, fromUser, [{
+      title: `已订阅：《${sub.title}》`,
+      description: descParts.join(" · ") + (sub.overview ? `\n${sub.overview.slice(0, 72)}…` : ""),
+      url: cardUrl,
+      picurl: details.poster_url,
+    }]);
+  } catch {
+    await sendWecomText(store, cfg, secrets, fromUser, `✅ 已添加订阅：《${sub.title}》\n${descParts.join(" · ")}\nDriver 将在下一轮自动检索并转存。`);
+  }
+}
+
+async function processWecomMessage(
+  store: Store,
+  env: Env,
+  cfg: WecomPublicConfig,
+  secrets: WecomSecrets,
+  xml: string,
+  originUrl: string,
+): Promise<void> {
+  const fromUser = extractXmlTag(xml, "FromUserName") ?? "";
+  const msgType = extractXmlTag(xml, "MsgType") ?? "";
+  if (!fromUser) return;
+  if (cfg.allowed_users.length > 0 && !cfg.allowed_users.includes(fromUser)) {
+    await store.addLog({
+      level: "warn",
+      event: "wecom_unauthorized_user",
+      detail: JSON.stringify({ user: fromUser, msgType }),
+    });
+    return;
+  }
+
+  try {
+    if (msgType === "event") {
+      const ev = (extractXmlTag(xml, "Event") ?? "").toUpperCase();
+      const key = extractXmlTag(xml, "EventKey") ?? "";
+      if (ev === "CLICK") {
+        if (key === "SEARCH_HELP") {
+          await sendWecomText(
+            store, cfg, secrets, fromUser,
+            "🔍 直接发送电影或剧名即可搜索订阅，例如：`谷雨`、`仙逆`\n\n快捷指令：\n• 发送 `订阅` 查看追更中进度\n• 发送 `已完成` 查看已完结列表\n• 发送 `状态` 查看系统概览\n• 发送 `日志` 查看最近记录\n• 发送 `0` 或 `取消` 退出当前选剧会话",
+          );
+        } else if (key === "SUBS_ACTIVE") {
+          await sendWecomText(store, cfg, secrets, fromUser, await formatWecomSubsReply(store, "active"));
+        } else if (key === "SUBS_FINISHED") {
+          await sendWecomText(store, cfg, secrets, fromUser, await formatWecomSubsReply(store, "finished"));
+        } else if (key === "SYS_STATUS") {
+          await sendWecomText(store, cfg, secrets, fromUser, await formatWecomStatusReply(store, env));
+        } else if (key === "RECENT_LOGS") {
+          await sendWecomText(store, cfg, secrets, fromUser, await formatWecomLogsReply(store));
+        }
+      }
+      return;
+    }
+
+    if (msgType !== "text") {
+      await sendWecomText(store, cfg, secrets, fromUser, "暂仅支持发送文字片名搜剧或快捷指令（发送「帮助」查看说明）。");
+      return;
+    }
+
+    const content = (extractXmlTag(xml, "Content") ?? "").trim();
+    if (!content) return;
+    const lower = content.toLowerCase();
+
+    if (content === "0" || content === "取消" || content === "退出") {
+      await clearWecomSession(store, fromUser);
+      await sendWecomText(store, cfg, secrets, fromUser, "已取消当前操作。直接发送片名可重新搜索。");
+      return;
+    }
+    if (content === "帮助" || lower === "help" || content === "?" || content === "？") {
+      await sendWecomText(
+        store, cfg, secrets, fromUser,
+        "🔍 PanPilot 企业微信助手\n• 直接发送片名：搜索 TMDB 并回复序号订阅（默认自动转存）\n• 快捷指令：`订阅` / `已完成` / `状态` / `日志` / `取消`",
+      );
+      return;
+    }
+    if (content === "订阅" || content === "追更") {
+      await sendWecomText(store, cfg, secrets, fromUser, await formatWecomSubsReply(store, "active"));
+      return;
+    }
+    if (content === "已完成" || content === "完结") {
+      await sendWecomText(store, cfg, secrets, fromUser, await formatWecomSubsReply(store, "finished"));
+      return;
+    }
+    if (content === "状态") {
+      await sendWecomText(store, cfg, secrets, fromUser, await formatWecomStatusReply(store, env));
+      return;
+    }
+    if (content === "日志") {
+      await sendWecomText(store, cfg, secrets, fromUser, await formatWecomLogsReply(store));
+      return;
+    }
+
+    const session = await loadWecomSession(store, fromUser);
+    if (session && /^\d+$/.test(content)) {
+      const idx = Number(content) - 1;
+      if (session.step === "pick_media" && session.items) {
+        if (idx < 0 || idx >= session.items.length) {
+          await sendWecomText(store, cfg, secrets, fromUser, `序号超出范围，请回复 1–${session.items.length}，或回复 0 取消。`);
+          return;
+        }
+        const picked = session.items[idx];
+        const { details, errorMessage } = await getTmdbItemDetails(
+          store,
+          picked.media_type === "movie" ? "movie" : "tv",
+          String(picked.tmdb_id),
+        );
+        if (!details) {
+          await sendWecomText(store, cfg, secrets, fromUser, `获取详情失败：${errorMessage ?? "请稍后重试"}`);
+          return;
+        }
+        if (details.media_type === "movie") {
+          await clearWecomSession(store, fromUser);
+          await subscribeFromWecom(store, cfg, secrets, fromUser, originUrl, details);
+          return;
+        }
+        const regularSeasons = (details.seasons ?? []).filter((s) => s.season >= 1);
+        if (regularSeasons.length <= 1) {
+          const only = regularSeasons[0];
+          await clearWecomSession(store, fromUser);
+          await subscribeFromWecom(
+            store, cfg, secrets, fromUser, originUrl, details,
+            only ? only.season : 1, only?.episode_count,
+          );
+          return;
+        }
+        await saveWecomSession(store, fromUser, {
+          step: "pick_season",
+          expires_at: now() + WECOM_SESSION_TTL,
+          item: { ...details, seasons: regularSeasons },
+        });
+        const sLines = regularSeasons.slice(0, 15).map((s, si) =>
+          `${si + 1}. 第 ${s.season} 季${s.episode_count ? `（${s.episode_count} 集）` : ""}${s.name ? ` · ${s.name}` : ""}`,
+        );
+        await sendWecomText(
+          store, cfg, secrets, fromUser,
+          `📺 《${details.title}》共 ${regularSeasons.length} 季，请回复序号选择要订阅的季（回复 0 取消）：\n${sLines.join("\n")}`,
+        );
+        return;
+      }
+
+      if (session.step === "pick_season" && session.item && session.item.seasons) {
+        const seasons = session.item.seasons;
+        if (idx < 0 || idx >= seasons.length) {
+          await sendWecomText(store, cfg, secrets, fromUser, `序号超出范围，请回复 1–${seasons.length}，或回复 0 取消。`);
+          return;
+        }
+        const chosenSeason = seasons[idx];
+        await clearWecomSession(store, fromUser);
+        await subscribeFromWecom(
+          store, cfg, secrets, fromUser, originUrl, session.item,
+          chosenSeason.season, chosenSeason.episode_count,
+        );
+        return;
+      }
+    }
+
+    // Start a fresh TMDB search.
+    const { results, errorCode, errorMessage } = await searchTmdbItems(store, content);
+    if (!results) {
+      if (errorCode === "tmdb_not_configured") {
+        await sendWecomText(store, cfg, secrets, fromUser, "⚠️ TMDB API Key 尚未配置，请先在 PanPilot 网页「设置 → 媒体信息」保存 Key。");
+      } else {
+        await sendWecomText(store, cfg, secrets, fromUser, `搜索 TMDB 失败：${errorMessage ?? "请稍后重试"}`);
+      }
+      return;
+    }
+    if (!results.length) {
+      await sendWecomText(store, cfg, secrets, fromUser, `未在 TMDB 找到「${content}」相关影视，请换个关键词重试。`);
+      return;
+    }
+
+    const top = results.slice(0, 8);
+    await saveWecomSession(store, fromUser, {
+      step: "pick_media",
+      expires_at: now() + WECOM_SESSION_TTL,
+      items: top,
+    });
+    const lines = top.map((it, i) => {
+      const parts = [
+        it.year ? String(it.year) : "",
+        it.media_type === "movie" ? "电影" : "剧集",
+        it.region || "",
+        it.rating ? `★${it.rating.toFixed(1)}` : "",
+      ].filter(Boolean);
+      return `${i + 1}. ${it.title}${parts.length ? ` (${parts.join(" · ")})` : ""}`;
+    });
+    await sendWecomText(
+      store, cfg, secrets, fromUser,
+      `🔍 搜索「${content}」结果，回复序号即可订阅（默认自动转存，回复 0 取消）：\n${lines.join("\n")}`,
+    );
+  } catch (e) {
+    await store.addLog({
+      level: "error",
+      event: "wecom_message_error",
+      detail: e instanceof Error ? e.message.slice(0, 300) : String(e),
+    });
+  }
+}
+
+async function handleWecomVerifyFile(pathname: string, store: Store): Promise<Response | null> {
+  const name = pathname.slice(1);
+  if (!/^WW_verify_[A-Za-z0-9._-]+\.txt$/.test(name)) return null;
+  const cfg = await getWecomConfig(store);
+  if (cfg.verify_file_name === name && cfg.verify_file_content) {
+    return new Response(cfg.verify_file_content, {
+      status: 200,
+      headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+    });
+  }
+  return null;
+}
+
+async function handleWecomCallback(
+  req: Request,
+  url: URL,
+  store: Store,
+  env: Env,
+  ctx?: ExecutionContext,
+): Promise<Response> {
+  const cfg = await getWecomConfig(store);
+  const secrets = await getWecomSecretsPlain(store, env);
+  if (!secrets.token || !secrets.encoding_aes_key) {
+    return new Response("WeCom callback not configured", { status: 503 });
+  }
+  const msgSig = url.searchParams.get("msg_signature") ?? "";
+  const timestamp = url.searchParams.get("timestamp") ?? "";
+  const nonce = url.searchParams.get("nonce") ?? "";
+
+  if (req.method === "GET") {
+    const echostr = url.searchParams.get("echostr") ?? "";
+    if (!(await verifyWecomSignature(secrets.token, timestamp, nonce, echostr, msgSig))) {
+      return new Response("invalid signature", { status: 403 });
+    }
+    try {
+      const { message } = await wecomDecrypt(secrets.encoding_aes_key, echostr, cfg.corp_id || undefined);
+      return new Response(message, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+    } catch (e) {
+      return new Response(`decrypt failed: ${e instanceof Error ? e.message : String(e)}`, { status: 400 });
+    }
+  }
+
+  if (req.method !== "POST") return err("method_not_allowed", "method not allowed", 405);
+  const rawXml = await req.text();
+  const encrypt = extractXmlTag(rawXml, "Encrypt") ?? "";
+  if (!encrypt || !(await verifyWecomSignature(secrets.token, timestamp, nonce, encrypt, msgSig))) {
+    return new Response("invalid signature", { status: 403 });
+  }
+  let xml = "";
+  try {
+    const dec = await wecomDecrypt(secrets.encoding_aes_key, encrypt, cfg.corp_id || undefined);
+    xml = dec.message;
+  } catch (e) {
+    return new Response(`decrypt failed: ${e instanceof Error ? e.message : String(e)}`, { status: 400 });
+  }
+
+  if (!cfg.enabled) {
+    return new Response("", { status: 200 });
+  }
+  const msgId = extractXmlTag(xml, "MsgId") ?? "";
+  if (msgId && (await isDuplicateWecomMsg(store, msgId))) {
+    return new Response("", { status: 200 });
+  }
+  runBg(ctx, processWecomMessage(store, env, cfg, secrets, xml, url.origin));
+  return new Response("", { status: 200 });
+}
+
+function htmlNotice(title: string, bodyText: string, status: number): Response {
+  const escHtml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return new Response(
+    `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escHtml(title)}</title>`
+    + `<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#09090b;color:#f3f4f6;font-family:system-ui,sans-serif;padding:1.5rem}`
+    + `.box{max-width:420px;background:#15171d;border:1px solid rgba(255,255,255,.12);border-radius:16px;padding:1.5rem;line-height:1.6}`
+    + `h2{margin:0 0 .5rem;font-size:1.1rem;color:#e5a00d}p{margin:0;color:#c9cdd8;font-size:.92rem}</style></head>`
+    + `<body><div class="box"><h2>${escHtml(title)}</h2><p>${escHtml(bodyText)}</p></div></body></html>`,
+    { status, headers: { "content-type": "text/html; charset=utf-8" } },
+  );
+}
+
+async function handleWecomOAuth(url: URL, store: Store, env: Env): Promise<Response> {
+  const cfg = await getWecomConfig(store);
+  const secrets = await getWecomSecretsPlain(store, env);
+  if (!cfg.enabled || !cfg.oauth_enabled || !cfg.corp_id || !secrets.secret) {
+    return htmlNotice("企微免密登录未启用", "请先在 PanPilot「设置 → 企业微信」启用应用并开启 OAuth2 免密登录。", 403);
+  }
+  const code = url.searchParams.get("code")?.trim() ?? "";
+  let next = url.searchParams.get("next") ?? "/";
+  if (!next.startsWith("/") || next.startsWith("//")) next = "/";
+  if (!code) {
+    return new Response(null, { status: 302, headers: { location: buildWecomOAuthUrl(cfg, url.origin, next) } });
+  }
+  if (!cfg.allowed_users.length) {
+    return htmlNotice(
+      "未配置允许的 UserID 白名单",
+      "为保障安全，免密登录要求先在「设置 → 企业微信」填写允许访问的 UserID 白名单。",
+      403,
+    );
+  }
+  try {
+    const info = await exchangeWecomOAuthCode(store, cfg, secrets, code);
+    if (!info.userid || !cfg.allowed_users.includes(info.userid)) {
+      await store.addLog({
+        level: "warn",
+        event: "wecom_oauth_denied",
+        detail: JSON.stringify({ userid: info.userid ?? null, openid: info.openid ?? null }),
+      });
+      return htmlNotice(
+        "无权免密访问",
+        `当前企业微信账号（${info.userid || "非企业成员"}）不在允许的白名单中，请先在控制台将其 UserID 加入白名单。`,
+        403,
+      );
+    }
+    const auth = await getEffectiveAuth(env, store);
+    const headers: Record<string, string> = { location: next };
+    if (auth) {
+      const value = await makeSessionCookie(env, auth.username, auth.fingerprint);
+      const secure = url.protocol === "https:" ? "; Secure" : "";
+      headers["set-cookie"] =
+        `${SESSION_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL_SECONDS}${secure}`;
+    }
+    await store.addLog({
+      level: "info",
+      event: "wecom_oauth_login",
+      detail: JSON.stringify({ userid: info.userid, next }),
+    });
+    return new Response(null, { status: 302, headers });
+  } catch (e) {
+    return htmlNotice("企微身份校验失败", e instanceof Error ? e.message : String(e), 502);
+  }
+}
+
+async function handleWecomSyncMenu(url: URL, store: Store, env: Env): Promise<Response> {
+  const cfg = await getWecomConfig(store);
+  const secrets = await getWecomSecretsPlain(store, env);
+  if (!cfg.corp_id || !cfg.agent_id || !secrets.secret) {
+    return err("bad_request", "请先填写并保存 CorpID、AgentID 和应用 Secret", 400);
+  }
+  try {
+    await syncWecomMenu(store, cfg, secrets, url.origin);
+    await store.addLog({ level: "info", event: "wecom_menu_synced" });
+    return json({ ok: true });
+  } catch (e) {
+    return err("wecom_upstream_error", e instanceof Error ? e.message : String(e), 502);
+  }
+}
+
+async function handleWecomTest(store: Store, env: Env): Promise<Response> {
+  const cfg = await getWecomConfig(store);
+  const secrets = await getWecomSecretsPlain(store, env);
+  if (!cfg.corp_id || !cfg.agent_id || !secrets.secret) {
+    return err("bad_request", "请先填写并保存 CorpID、AgentID 和应用 Secret", 400);
+  }
+  try {
+    const target = wecomNotifyTarget(cfg);
+    await sendWecomText(
+      store, cfg, secrets, target,
+      "✅ PanPilot 企业微信联动测试成功！\n直接回复剧名即可搜索并自动订阅。",
+    );
+    await store.addLog({ level: "info", event: "wecom_test_sent", detail: JSON.stringify({ target }) });
+    return json({ ok: true, target });
+  } catch (e) {
+    return err("wecom_upstream_error", e instanceof Error ? e.message : String(e), 502);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2218,12 +3026,18 @@ async function handleTmdbDetails(url: URL, store: Store): Promise<Response> {
 // ---------------------------------------------------------------------------
 
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(req.url);
     const { pathname } = url;
     const store = getStore(env);
 
     try {
+      // WeCom trusted-domain verification file (WW_verify_*.txt).
+      if (pathname.startsWith("/WW_verify_") && pathname.endsWith(".txt") && req.method === "GET") {
+        const vRes = await handleWecomVerifyFile(pathname, store);
+        if (vRes) return vRes;
+      }
+
       // Public endpoints.
       if (pathname === "/api/health") {
         const hasUiKey = (await store.listDriverKeys()).some((k) => !k.revoked_at);
@@ -2238,6 +3052,8 @@ export default {
       }
       if (pathname === "/login") return handleLogin(req, env, url, store);
       if (pathname === "/logout" && req.method === "POST") return handleLogout();
+      if (pathname === "/api/wecom/callback") return handleWecomCallback(req, url, store, env, ctx);
+      if (pathname === "/api/wecom/oauth" && req.method === "GET") return handleWecomOAuth(url, store, env);
 
       // Driver API — independent API key (UI-managed key or bootstrap
       // DRIVER_TOKEN secret), unaffected by web login.
@@ -2247,11 +3063,11 @@ export default {
         if (pathname === "/api/driver/pending" && req.method === "GET") return handleDriverPending(url, store);
         if (pathname === "/api/driver/claim" && req.method === "POST") return handleDriverClaim(req, store);
         if (pathname === "/api/driver/candidates" && req.method === "POST") return handleDriverCandidates(req, store);
-        if (pathname === "/api/driver/progress" && req.method === "POST") return handleDriverProgress(req, store, env);
+        if (pathname === "/api/driver/progress" && req.method === "POST") return handleDriverProgress(req, store, env, ctx);
         if (pathname === "/api/driver/heartbeat" && req.method === "POST") return handleDriverHeartbeat(req, store);
         if (pathname === "/api/driver/logs" && req.method === "POST") return handleDriverLogs(req, store);
         if (pathname === "/api/driver/config" && req.method === "GET") return handleDriverConfig(store, env);
-        if (pathname === "/api/driver/quark-status" && req.method === "POST") return handleDriverQuarkStatus(req, store);
+        if (pathname === "/api/driver/quark-status" && req.method === "POST") return handleDriverQuarkStatus(req, store, env, ctx);
         if (pathname === "/api/driver/agent-guide" && req.method === "GET") return handleDriverAgentGuide();
         return err("not_found", "unknown driver endpoint", 404);
       }
@@ -2320,6 +3136,9 @@ export default {
 
       if (pathname === "/api/tmdb/search" && req.method === "GET") return handleTmdbSearch(url, store);
       if (pathname === "/api/tmdb/details" && req.method === "GET") return handleTmdbDetails(url, store);
+
+      if (pathname === "/api/wecom/menu/sync" && req.method === "POST") return handleWecomSyncMenu(url, store, env);
+      if (pathname === "/api/wecom/test" && req.method === "POST") return handleWecomTest(store, env);
 
       return err("not_found", "not found", 404);
     } catch (e) {
