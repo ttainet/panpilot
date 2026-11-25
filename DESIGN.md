@@ -1,7 +1,15 @@
-# PanPilot 设计稿 v0.4（已部署上线）
+# PanPilot 设计稿 v0.5（已部署上线）
 
-> 状态：v0.4 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
+> 状态：v0.5 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
 > 线上验证（health 为 store=d1、登录与 Driver Token 鉴权正常）。本文档描述目标架构与接口契约。
+>
+> v0.5 变更（均为用户明确拍板）：(1) **推翻此前「控制面不存 Cookie」的设计** —— 设置页可
+> 配置夸克 Cookie，但只以 **AES-GCM 加密**形式存 settings 表（密钥为 Worker Secret
+> `COOKIE_ENC_SECRET`，未配置则功能禁用、无明文兜底），网页端接口永不返回明文或密文，
+> 仅 Driver 经 `GET /api/driver/config` 可取回明文，并经 `POST /api/driver/quark-status`
+> 回报有效性（详见 §4.6/§6/§9）；(2) **TG 频道列表可在设置页配置**：默认预填 2026-11-23
+> 逐个验证的 147 个有效频道（种子数据在 `src/channels.ts`），可自定义、恢复默认，并可
+> 开「只用夸克优先频道（76）」开关，Driver config 返回最终生效清单。
 >
 > v0.4 变更：前端按 MoviePilot 风格重做为深色单页应用（左侧导航 + 仪表盘统计卡 +
 > 海报墙订阅卡片 + 发现页海报网格/详情弹窗 + 卡片式设置页；布局与交互为参考，
@@ -48,14 +56,18 @@ PanPilot 是一个**影视订阅控制面**，部署在 Cloudflare Workers 上�
               ┌────────────────┴─────────────────┐
               ▼                                  ▼
      Driver v1: Muse                    Driver v2: 自写程序
-     （定时唤醒、浏览器登录态              （家庭设备、夸克接口、
-       执行搜索与转存）                      Cookie 只存本机）
+     （定时唤醒、浏览器登录态              （家庭设备、经 config 接口取
+       或经 config 取 Cookie 执行）           Cookie 调夸克接口执行）
               │                                  │
               ├─► PanSou / t.me/s 频道搜索（147 有效频道，76 夸克优先）
               └─► 夸克网盘（列目录 / 选集转存 / 重命名 / 复核）
 ```
 
-**铁律：控制面不存任何网盘 Cookie / 密码 / 登录态。** Cookie 只存在 Driver 所在设备上。
+**凭据边界（v0.5 修订）：控制面不存任何网盘密码/登录态；夸克 Cookie 仅在用户主动
+在设置页填写时保存，且必须是 AES-GCM 密文**（密钥 `COOKIE_ENC_SECRET` 只在 Worker
+Secret 中，不进 D1/代码/日志）。网页端永远看不到 Cookie（明文与密文都不返回），只有
+持 Driver Token 的 Driver 能经 API 取回明文。用户也可以不填 Cookie、继续让 Driver
+用自己设备上的登录态执行。不填 Cookie 时本条与原「不存 Cookie」设计等价。
 
 ## 3. 用户目录规范（Driver 入库必须遵守）
 
@@ -174,8 +186,16 @@ PanPilot 是一个**影视订阅控制面**，部署在 Cloudflare Workers 上�
 | value | TEXT NOT NULL | JSON 字符串 |
 | updated_at | INTEGER NOT NULL | |
 
-频道清单（147 有效 / 76 夸克优先）作为 settings 的初始种子数据导入，不写死在代码里。
+频道清单（147 有效 / 76 夸克优先）作为代码内种子数据（`src/channels.ts`，来源为
+2026-11-23 的逐个验证清单）：settings 无 `tg_channels` 时生效清单即默认 147；设置页可
+保存自定义清单（`tg_channels`，JSON 数组）、恢复默认（删除该键）、开/关「只用夸克优先」
+（`tg_channels_priority_only`）。优先开关的语义：默认清单时直接取 76 子集；自定义清单时
+取其与 76 子集的交集，交集为空则退回自定义全量并在 Driver config 里以
+`tg_channels_priority_fallback: true` 标注。
 `tmdb_api_key` 由设置页写入（见 §11 已定项 3），读取时只返回末 4 位掩码，完整 Key 不出服务端。
+夸克 Cookie 相关键（v0.5）：`quark_cookie_enc`（AES-GCM 密文 JSON `{iv, ct}`，**绝无明文**）、
+`quark_cookie_updated_at`、`quark_cookie_status` / `quark_cookie_checked_at`（Driver 回报的
+有效性与时间）。加密密钥 `COOKIE_ENC_SECRET` 是 Worker Secret，不在 settings 表中。
 `auth_username` / `auth_password` 为网页登录凭据的**后台覆盖值**（见 §7）：`auth_password`
 存 PBKDF2-SHA256 哈希对象 `{salt, iterations, hash}`（随机盐，100k 次迭代），绝不存明文。
 
@@ -209,6 +229,8 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
 | `POST /api/driver/progress` | 回写集进度与订阅状态 | `{ task_id, episodes: [{season, episode, status, source_share_code?, quark_fid?, file_name?, file_size?}], subscription_status?, next_check_at?, note? }` |
 | `POST /api/driver/heartbeat` | 续约 + 存活上报 | `{ task_id, driver_id }` → `{ lease_expires_at }`；同时可上报 `driver_status`（如 `quark_login_ok: false`） |
 | `POST /api/driver/logs`（可选） | 批量上报日志 | `{ task_id?, logs: [{level, event, detail?}] }` |
+| `GET /api/driver/config` | 取本轮执行配置（v0.5） | → `{ quark_cookie: string\|null, tg_channels: string[], tg_channels_priority_only, tg_channels_priority_fallback, check_interval_hours }`；响应 `Cache-Control: no-store`；每次取用写一条审计日志（只记事件不记内容） |
+| `POST /api/driver/quark-status` | 回报夸克 Cookie 有效性（v0.5） | `{ status: "ok"\|"invalid", note?, driver_id? }` → 存 settings 并在设置页展示；`invalid` 时页面红色提示重新粘贴 |
 
 网页端 API（非 Driver）：
 
@@ -259,8 +281,15 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
 
 ## 9. 安全边界
 
-- 控制面（Workers/D1）**不存**夸克 Cookie、账号密码、TG 账号信息；只存订阅、候选
+- 控制面（Workers/D1）**不存**网盘账号密码、TG 账号信息；只存订阅、候选
   分享链接、进度、日志。分享链接本身按敏感数据对待，页面与 API 均需鉴权后才可见。
+- 夸克 Cookie（v0.5，应用户要求）：只以 AES-GCM 密文存 D1，解密密钥 `COOKIE_ENC_SECRET`
+  是独立的 Worker Secret（与 D1 分离保管）；网页端接口（含设置读取）永不返回明文或密文，
+  只返回是否已配置、更新时间、长度与 Driver 回报的有效性；明文仅经 Driver Token 鉴权的
+  `GET /api/driver/config` 出口。保存/清除/取用均写审计日志（只记事件与长度，不记内容）。
+  **风险提示**：若 D1 数据与 `COOKIE_ENC_SECRET` 同时泄露，Cookie 即等同泄露；Cookie
+  本身等同登录凭证，失效或怀疑泄露时应在夸克端退出登录/改密使其作废，并在设置页清除
+  或更新。未配置 `COOKIE_ENC_SECRET` 时功能硬禁用，不存在明文保存路径。
 - Driver Token 与网页端凭据分离存储、分离轮换；日志 detail 禁止写入 Token/Cookie。
 - 转存是夸克服务端内的操作，文件数据不经过 Workers，也不经过 Driver 的下载/上传中转。
 - 执行频率克制：默认检查间隔 ≥ 6 小时、认领后串行处理，避免高频调用触发平台风控；
@@ -290,7 +319,14 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
    地区分类按 TMDB `origin_country` 映射（CN→国产剧、HK/TW→港台剧、JP→日剧、KR→韩剧、其他→欧美剧，电影同理）。
    Key 未配置时选剧功能给出明确提示，手动填写订阅仍可用。
 
+已定（2026-11-25 用户追加拍板，v0.5 已实现并本地验证）：
+
+4. ~~控制面不存 Cookie~~ **已推翻**：设置页可配置夸克 Cookie（AES-GCM 加密存储、
+   仅 Driver 可取明文，设计与风险提示见 §9），Driver 拿到 Cookie 直接调夸克接口转存，
+   不再强依赖浏览器登录态。同时 TG 频道列表可在设置页配置，默认预填已验证的
+   147 个有效频道（其中 76 个夸克优先，见 §4.6）。
+
 仍待定：
 
-4. 一期是否只支持夸克一种网盘（建议是）。
-5. Driver 通知渠道（TG Bot / 邮件 / 其他）。
+5. 一期是否只支持夸克一种网盘（建议是）。
+6. Driver 通知渠道（TG Bot / 邮件 / 其他）。

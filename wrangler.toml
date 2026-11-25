@@ -30,6 +30,7 @@ migrations_dir = "migrations"
 #   wrangler secret put APP_PASSWORD     # 网页端登录密码
 #   wrangler secret put DRIVER_TOKEN     # Driver 的 Bearer Token（与网页登录独立）
 #   wrangler secret put SESSION_SECRET   # 可选：会话 Cookie 签名密钥（默认由 APP_PASSWORD 派生）
+#   wrangler secret put COOKIE_ENC_SECRET # 可选：夸克 Cookie 的 AES-GCM 加密密钥（32 字节 hex）；未设则 Cookie 功能禁用
 # 本地开发把假值写进 .dev.vars（已 gitignore），不要提交真实密钥。
 [vars]
 CHECK_INTERVAL_HOURS = "6"

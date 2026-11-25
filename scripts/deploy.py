@@ -8,7 +8,12 @@ api.cloudflare.com. Nothing secret is printed; generated secret values are
 only reported as "set".
 
 Usage:
-  python3 scripts/deploy.py [--step d1|migrate|bundle|upload|secrets|domain|toml|all]
+  python3 scripts/deploy.py [--step d1|migrate|bundle|upload|secrets|enc-secret|domain|toml|all]
+
+The `enc-secret` step (v0.5) only ensures COOKIE_ENC_SECRET exists: it lists
+the script's secret names and generates the value solely when missing, so
+re-running it never rotates DRIVER_TOKEN / SESSION_SECRET / passwords. Use it
+together with bundle+upload for feature deploys that must keep live secrets.
 
 The `migrate` step applies every migrations/*.sql file (in filename order)
 against the existing database; statements that fail only because the object
@@ -281,6 +286,35 @@ def step_secrets() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step: COOKIE_ENC_SECRET only (v0.5) — set-if-absent, never rotates anything
+# ---------------------------------------------------------------------------
+
+def step_enc_secret() -> None:
+    """Ensure COOKIE_ENC_SECRET exists on the deployed script.
+
+    The existing secrets (APP_USERNAME / APP_PASSWORD / SESSION_SECRET /
+    DRIVER_TOKEN) are never touched: we list the secret names first and only
+    generate + PUT COOKIE_ENC_SECRET when it is missing. The value is 32
+    random bytes as hex and is never printed."""
+    status, payload = api("GET", f"/accounts/{ACCOUNT_ID}/workers/scripts/{SCRIPT_NAME}/secrets")
+    if status != 200 or not payload.get("success"):
+        fail("enc-secret-list", status, payload)
+    names = {s.get("name") for s in payload.get("result", [])}
+    print(f"[enc-secret] existing secrets: {sorted(n for n in names if n)}")
+    if "COOKIE_ENC_SECRET" in names:
+        print("[enc-secret] COOKIE_ENC_SECRET already set — skipped (value unchanged)")
+        return
+    value = pysecrets.token_hex(32)
+    status, payload = api(
+        "PUT", f"/accounts/{ACCOUNT_ID}/workers/scripts/{SCRIPT_NAME}/secrets",
+        {"name": "COOKIE_ENC_SECRET", "text": value, "type": "secret_text"},
+    )
+    if not (200 <= status < 300) or not payload.get("success"):
+        fail("enc-secret-put", status, payload)
+    print("[enc-secret] COOKIE_ENC_SECRET: set (generated, not printed)")
+
+
+# ---------------------------------------------------------------------------
 # Step: custom domain binding
 # ---------------------------------------------------------------------------
 
@@ -366,7 +400,7 @@ def step_toml(uuid: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--step", default="all",
-                    choices=["d1", "migrate", "bundle", "upload", "secrets", "domain", "toml", "all"])
+                    choices=["d1", "migrate", "bundle", "upload", "secrets", "enc-secret", "domain", "toml", "all"])
     args = ap.parse_args()
     state = load_state()
 
@@ -391,6 +425,8 @@ def main() -> None:
         step_upload(bundle, need_uuid())
     if args.step in ("secrets", "all"):
         step_secrets()
+    if args.step in ("enc-secret", "all"):
+        step_enc_secret()
     if args.step in ("domain", "all"):
         step_domain()
     if args.step in ("toml", "all"):

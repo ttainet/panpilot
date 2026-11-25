@@ -17,8 +17,18 @@
  * - Driver API uses an independent Bearer token (DRIVER_TOKEN secret).
  * - Settings page stores the TMDB API key in the settings table (masked in
  *   the UI); TMDB search/detail endpoints power the subscribe flow.
- * No cloud-drive cookies are ever stored here (see DESIGN.md §9).
+ *
+ * v0.5: at the owner's explicit request, the settings page can also store a
+ * Quark cookie — but ONLY AES-GCM-encrypted (key from the COOKIE_ENC_SECRET
+ * Worker secret; the feature is disabled when that secret is unset, there is
+ * no plaintext fallback). The web API never returns the cookie (plaintext or
+ * ciphertext); only the Driver API (GET /api/driver/config) may retrieve the
+ * decrypted value, and the Driver reports validity back via
+ * POST /api/driver/quark-status. TG channel lists are also configurable in
+ * settings, defaulting to the verified seed lists in channels.ts.
  */
+
+import { DEFAULT_TG_CHANNELS, PRIORITY_TG_CHANNELS } from "./channels";
 
 export interface Env {
   DB?: D1Database;
@@ -30,11 +40,18 @@ export interface Env {
   APP_PASSWORD?: string;
   /** Optional dedicated session-signing secret; falls back to APP_PASSWORD. */
   SESSION_SECRET?: string;
+  /**
+   * AES-GCM key for the stored Quark cookie: 32 random bytes as hex
+   * (64 hex chars), set via `wrangler secret put COOKIE_ENC_SECRET`.
+   * When unset/invalid, the cookie feature is disabled — cookies are
+   * never stored in plaintext as a fallback.
+   */
+  COOKIE_ENC_SECRET?: string;
   /** Hours between Driver rounds (default 6). */
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -1124,11 +1141,33 @@ function maskKey(key: string): string {
 async function handleGetSettings(store: Store, env: Env): Promise<Response> {
   const key = await getTmdbApiKey(store);
   const auth = await getEffectiveAuth(env, store);
+  const cookieMeta = await getQuarkCookieMeta(store, env);
+  const eff = await getEffectiveChannels(store);
   return json({
     settings: {
       tmdb_api_key: { configured: !!key, masked: key ? maskKey(key) : null },
       check_interval_hours: checkIntervalSeconds(env) / 3600,
       account: auth ? { username: auth.username, source: auth.source } : null,
+      // Cookie: status metadata only — never the value (nor its ciphertext).
+      quark_cookie: {
+        enc_configured: !!(await cookieEncKey(env)),
+        configured: cookieMeta.configured,
+        updated_at: cookieMeta.updated_at ?? null,
+        length: cookieMeta.length ?? null,
+        driver_status: cookieMeta.driver_status ?? null,
+        driver_checked_at: cookieMeta.driver_checked_at ?? null,
+      },
+      tg_channels: {
+        custom: eff.custom != null,
+        count: eff.channels.length,
+        base_count: (eff.custom ?? DEFAULT_TG_CHANNELS).length,
+        priority_only: eff.priority_only,
+        priority_fallback: eff.priority_fallback,
+        default_count: DEFAULT_TG_CHANNELS.length,
+        priority_count: PRIORITY_TG_CHANNELS.length,
+        // The effective list is what the settings textarea shows/edits.
+        effective: eff.channels,
+      },
     },
   });
 }
@@ -1194,18 +1233,274 @@ async function handleChangeAccount(req: Request, env: Env, store: Store): Promis
 }
 
 async function handleUpdateSettings(req: Request, store: Store, env: Env): Promise<Response> {
-  const input = await body<{ tmdb_api_key?: string; clear_tmdb_api_key?: boolean }>(req);
+  const input = await body<{
+    tmdb_api_key?: string;
+    clear_tmdb_api_key?: boolean;
+    quark_cookie?: string;
+    clear_quark_cookie?: boolean;
+    tg_channels?: unknown;
+    reset_tg_channels?: boolean;
+    tg_channels_priority_only?: boolean;
+  }>(req);
   if (!input) return err("bad_request", "invalid JSON body", 400);
+  let changed = false;
+
   if (input.clear_tmdb_api_key) {
     await store.deleteSetting(SETTING_TMDB_API_KEY);
+    changed = true;
   } else if (typeof input.tmdb_api_key === "string") {
     const key = input.tmdb_api_key.trim();
     if (!key) return err("bad_request", "tmdb_api_key must not be empty (use clear_tmdb_api_key to remove)", 400);
     await store.setSetting(SETTING_TMDB_API_KEY, JSON.stringify(key));
-  } else {
-    return err("bad_request", "nothing to update: provide tmdb_api_key or clear_tmdb_api_key", 400);
+    changed = true;
+  }
+
+  // --- Quark cookie: AES-GCM encrypted at rest; no plaintext fallback. ---
+  if (input.clear_quark_cookie) {
+    await store.deleteSetting(SETTING_QUARK_COOKIE_ENC);
+    await store.deleteSetting(SETTING_QUARK_COOKIE_UPDATED_AT);
+    await store.deleteSetting(SETTING_QUARK_COOKIE_STATUS);
+    await store.deleteSetting(SETTING_QUARK_COOKIE_CHECKED_AT);
+    await store.addLog({ level: "info", event: "quark_cookie_cleared" });
+    changed = true;
+  } else if (typeof input.quark_cookie === "string") {
+    const cookie = input.quark_cookie.trim();
+    if (!cookie) return err("bad_request", "quark_cookie must not be empty (use clear_quark_cookie to remove)", 400);
+    if (cookie.length > 20000) return err("bad_request", "quark_cookie is unreasonably long", 400);
+    const key = await cookieEncKey(env);
+    if (!key) {
+      return err(
+        "cookie_enc_not_configured",
+        "服务端未配置 COOKIE_ENC_SECRET，Cookie 加密存储功能已禁用；为安全起见不会明文保存。请先为 Worker 设置该 Secret。",
+        400,
+      );
+    }
+    const enc = await encryptText(key, cookie);
+    await store.setSetting(SETTING_QUARK_COOKIE_ENC, JSON.stringify(enc));
+    await store.setSetting(SETTING_QUARK_COOKIE_UPDATED_AT, JSON.stringify(now()));
+    // A fresh cookie has no Driver verdict yet.
+    await store.deleteSetting(SETTING_QUARK_COOKIE_STATUS);
+    await store.deleteSetting(SETTING_QUARK_COOKIE_CHECKED_AT);
+    await store.addLog({ level: "info", event: "quark_cookie_saved", detail: JSON.stringify({ length: cookie.length }) });
+    changed = true;
+  }
+
+  // --- TG channels: custom list / reset to defaults / priority-only flag. ---
+  if (input.reset_tg_channels) {
+    await store.deleteSetting(SETTING_TG_CHANNELS);
+    await store.addLog({ level: "info", event: "tg_channels_reset" });
+    changed = true;
+  } else if (input.tg_channels !== undefined) {
+    const norm = normalizeChannels(input.tg_channels);
+    if (norm.invalid) {
+      return err("bad_request", `频道名格式不合法（仅允许字母/数字/下划线，3–64 字符）：${norm.invalid.slice(0, 5).join(", ")}`, 400);
+    }
+    if (!norm.channels || norm.channels.length === 0) {
+      return err("bad_request", "频道列表为空；如需恢复默认请使用「恢复默认」", 400);
+    }
+    await store.setSetting(SETTING_TG_CHANNELS, JSON.stringify(norm.channels));
+    await store.addLog({ level: "info", event: "tg_channels_saved", detail: JSON.stringify({ count: norm.channels.length }) });
+    changed = true;
+  }
+  if (typeof input.tg_channels_priority_only === "boolean") {
+    await store.setSetting(SETTING_TG_PRIORITY_ONLY, JSON.stringify(input.tg_channels_priority_only));
+    changed = true;
+  }
+
+  if (!changed) {
+    return err("bad_request", "nothing to update: provide tmdb_api_key / quark_cookie / tg_channels / tg_channels_priority_only (or the clear/reset flags)", 400);
   }
   return handleGetSettings(store, env);
+}
+
+// ---------------------------------------------------------------------------
+// v0.5: encrypted Quark cookie + configurable TG channel lists (settings)
+// ---------------------------------------------------------------------------
+
+const SETTING_QUARK_COOKIE_ENC = "quark_cookie_enc";       // JSON {iv, ct} — AES-GCM ciphertext only
+const SETTING_QUARK_COOKIE_UPDATED_AT = "quark_cookie_updated_at";
+const SETTING_QUARK_COOKIE_STATUS = "quark_cookie_status"; // last Driver report: "ok" | "invalid"
+const SETTING_QUARK_COOKIE_CHECKED_AT = "quark_cookie_checked_at";
+const SETTING_TG_CHANNELS = "tg_channels";                 // JSON string[] — custom list; absent = defaults
+const SETTING_TG_PRIORITY_ONLY = "tg_channels_priority_only"; // JSON boolean
+
+/** Parse the COOKIE_ENC_SECRET (64 hex chars = 32 bytes) into an AES-GCM key. */
+async function cookieEncKey(env: Env): Promise<CryptoKey | null> {
+  const hex = (env.COOKIE_ENC_SECRET ?? "").trim();
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) return null;
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  try {
+    return await crypto.subtle.importKey("raw", bytes as BufferSource, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+  } catch {
+    return null;
+  }
+}
+
+async function encryptText(key: CryptoKey, plaintext: string): Promise<{ iv: string; ct: string }> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: iv as BufferSource }, key, new TextEncoder().encode(plaintext),
+  );
+  return { iv: bytesToB64(iv), ct: bytesToB64(new Uint8Array(ct)) };
+}
+
+async function decryptText(key: CryptoKey, payload: { iv: string; ct: string }): Promise<string | null> {
+  try {
+    const pt = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: b64ToBytes(payload.iv) as BufferSource }, key, b64ToBytes(payload.ct) as BufferSource,
+    );
+    return new TextDecoder().decode(pt);
+  } catch {
+    return null; // wrong key or corrupted ciphertext
+  }
+}
+
+interface QuarkCookieMeta {
+  configured: boolean;
+  updated_at?: number;
+  /** Plaintext length (metadata only — the value itself never leaves the server via web APIs). */
+  length?: number;
+  /** Last status reported by a Driver via /api/driver/quark-status. */
+  driver_status?: string;
+  driver_checked_at?: number;
+}
+
+async function getQuarkCookieMeta(store: Store, env: Env): Promise<QuarkCookieMeta> {
+  const raw = await store.getSetting(SETTING_QUARK_COOKIE_ENC);
+  if (!raw) return { configured: false };
+  const meta: QuarkCookieMeta = { configured: true };
+  const upd = await store.getSetting(SETTING_QUARK_COOKIE_UPDATED_AT);
+  if (upd) { const n = Number(JSON.parse(upd)); if (Number.isFinite(n)) meta.updated_at = n; }
+  const st = await store.getSetting(SETTING_QUARK_COOKIE_STATUS);
+  if (st) { try { const s = JSON.parse(st); if (typeof s === "string") meta.driver_status = s; } catch { /* ignore */ } }
+  const chk = await store.getSetting(SETTING_QUARK_COOKIE_CHECKED_AT);
+  if (chk) { const n = Number(JSON.parse(chk)); if (Number.isFinite(n)) meta.driver_checked_at = n; }
+  // Length is computed server-side from the decrypted value; only the number is exposed.
+  const key = await cookieEncKey(env);
+  if (key) {
+    try {
+      const plain = await decryptText(key, JSON.parse(raw) as { iv: string; ct: string });
+      if (plain != null) meta.length = plain.length;
+    } catch { /* malformed record — length stays unknown */ }
+  }
+  return meta;
+}
+
+/** Decrypt the stored Quark cookie. Driver API only — never call from web handlers. */
+async function getQuarkCookiePlaintext(store: Store, env: Env): Promise<string | null> {
+  const raw = await store.getSetting(SETTING_QUARK_COOKIE_ENC);
+  if (!raw) return null;
+  const key = await cookieEncKey(env);
+  if (!key) return null;
+  try {
+    return await decryptText(key, JSON.parse(raw) as { iv: string; ct: string });
+  } catch {
+    return null;
+  }
+}
+
+const CHANNEL_NAME_RE = /^[A-Za-z0-9_]{3,64}$/;
+
+/** Trim, drop "@" prefixes/empties, dedupe (case-insensitive), validate format. */
+function normalizeChannels(input: unknown): { channels?: string[]; invalid?: string[] } {
+  const rawList: string[] = [];
+  if (Array.isArray(input)) {
+    for (const v of input) if (typeof v === "string") rawList.push(v);
+  } else if (typeof input === "string") {
+    rawList.push(...input.split(/[\n,]+/));
+  } else {
+    return { invalid: ["(not a string or string[])"] };
+  }
+  const seen = new Set<string>();
+  const channels: string[] = [];
+  const invalid: string[] = [];
+  for (const raw of rawList) {
+    const name = raw.trim().replace(/^@+/, "");
+    if (!name) continue;
+    if (!CHANNEL_NAME_RE.test(name)) { invalid.push(name); continue; }
+    const k = name.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    channels.push(name);
+  }
+  return invalid.length ? { invalid } : { channels };
+}
+
+interface EffectiveChannels {
+  channels: string[];
+  /** The list the user saved in settings (before any priority filtering), or null when using defaults. */
+  custom: string[] | null;
+  priority_only: boolean;
+  /**
+   * When priority_only is on: with a custom list, the result is the
+   * intersection of the custom list and the verified priority set; if that
+   * intersection is empty we fall back to the full custom list and this flag
+   * is true (the Driver config surfaces it so the behaviour is explicit).
+   */
+  priority_fallback: boolean;
+}
+
+async function getEffectiveChannels(store: Store): Promise<EffectiveChannels> {
+  let custom: string[] | null = null;
+  const raw = await store.getSetting(SETTING_TG_CHANNELS);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) {
+        const norm = normalizeChannels(parsed);
+        if (norm.channels && norm.channels.length) custom = norm.channels;
+      }
+    } catch { /* malformed — treat as unset */ }
+  }
+  let priorityOnly = false;
+  const rawFlag = await store.getSetting(SETTING_TG_PRIORITY_ONLY);
+  if (rawFlag) { try { priorityOnly = JSON.parse(rawFlag) === true; } catch { /* ignore */ } }
+
+  const base = custom ?? DEFAULT_TG_CHANNELS;
+  if (!priorityOnly) return { channels: base, custom, priority_only: false, priority_fallback: false };
+  if (!custom) return { channels: [...PRIORITY_TG_CHANNELS], custom: null, priority_only: true, priority_fallback: false };
+  const prioSet = new Set(PRIORITY_TG_CHANNELS.map((c) => c.toLowerCase()));
+  const inter = base.filter((c) => prioSet.has(c.toLowerCase()));
+  if (inter.length) return { channels: inter, custom, priority_only: true, priority_fallback: false };
+  return { channels: base, custom, priority_only: true, priority_fallback: true };
+}
+
+/** GET /api/driver/config — everything a Driver needs for a round. No-store. */
+async function handleDriverConfig(store: Store, env: Env): Promise<Response> {
+  const cookie = await getQuarkCookiePlaintext(store, env);
+  const eff = await getEffectiveChannels(store);
+  await store.addLog({
+    level: "info", event: "driver_config_fetched",
+    detail: JSON.stringify({ cookie: cookie != null, channels: eff.channels.length, priority_only: eff.priority_only }),
+  });
+  return new Response(
+    JSON.stringify({
+      quark_cookie: cookie,
+      tg_channels: eff.channels,
+      tg_channels_priority_only: eff.priority_only,
+      tg_channels_priority_fallback: eff.priority_fallback,
+      check_interval_hours: checkIntervalSeconds(env) / 3600,
+    }),
+    { status: 200, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } },
+  );
+}
+
+/** POST /api/driver/quark-status — Driver reports whether the cookie still works. */
+async function handleDriverQuarkStatus(req: Request, store: Store): Promise<Response> {
+  const input = await body<{ status?: string; note?: string; driver_id?: string }>(req);
+  if (!input || (input.status !== "ok" && input.status !== "invalid")) {
+    return err("bad_request", 'status must be "ok" or "invalid"', 400);
+  }
+  await store.setSetting(SETTING_QUARK_COOKIE_STATUS, JSON.stringify(input.status));
+  await store.setSetting(SETTING_QUARK_COOKIE_CHECKED_AT, JSON.stringify(now()));
+  await store.addLog({
+    driver_id: typeof input.driver_id === "string" ? input.driver_id : undefined,
+    level: input.status === "ok" ? "info" : "warn",
+    event: "quark_cookie_status",
+    detail: JSON.stringify({ status: input.status, note: typeof input.note === "string" ? input.note.slice(0, 200) : undefined }),
+  });
+  return json({ ok: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -1381,14 +1676,17 @@ const APP_CSS = `
   }
   a { color: var(--pp-accent-2); text-decoration: none; }
   button, input, select, textarea { font: inherit; color: inherit; }
-  input, select {
+  input, select, textarea {
     background: var(--pp-bg-soft);
     border: 1px solid var(--pp-border);
     border-radius: 10px;
     padding: .55rem .7rem;
     outline: none;
   }
-  input:focus, select:focus { border-color: var(--pp-accent); }
+  textarea { width: 100%; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .85rem; line-height: 1.5; resize: vertical; }
+  input:focus, select:focus, textarea:focus { border-color: var(--pp-accent); }
+  .status-bad { color: var(--pp-red); font-weight: 600; }
+  .status-ok { color: var(--pp-green); }
   input::placeholder { color: #5d6577; }
   .btn {
     border: 1px solid var(--pp-border);
@@ -1621,7 +1919,7 @@ function LOGIN_HTML(failed: boolean): string {
       <input name="password" type="password" placeholder="密码" autocomplete="current-password" required>
       <button type="submit" class="btn btn-primary">登录</button>
     </form>
-    <p class="muted login-foot">订阅控制面。搜索与转存由外部 Driver 执行，本站不保存任何网盘 Cookie。</p>
+    <p class="muted login-foot">订阅控制面。搜索与转存由外部 Driver 执行；网盘 Cookie 仅在你主动填写后以 AES-GCM 加密形式保存，仅供你的 Driver 取用。</p>
   </div>
 </div>
 </body>
@@ -1733,6 +2031,31 @@ function appHtml(initialView: string): string {
             <button type="submit" class="btn btn-primary">保存</button>
             <button type="button" class="btn" id="tmdb-clear">清除</button>
           </form>
+        </div>
+        <div class="card" id="card-quark-cookie">
+          <h2>夸克网盘 Cookie</h2>
+          <p class="muted">Driver 用它直接调用夸克接口转存。Cookie 以 <strong>AES-GCM 加密</strong>形式保存在服务端（密钥为 Worker Secret，页面与接口永不回显明文）；只有持有 Driver Token 的 Driver 能取回。Cookie 等同于登录凭证，请只在本页填写，不要发到聊天或代码仓库里。</p>
+          <p>当前状态：<span id="cookie-status">加载中…</span></p>
+          <p id="cookie-driver-status" class="muted"></p>
+          <form id="cookie-form" class="inline">
+            <input id="cookie-input" type="password" placeholder="粘贴夸克 Cookie（已保存的值不会回显）" style="min-width:320px;flex:1" autocomplete="off">
+            <button type="submit" class="btn btn-primary">保存 Cookie</button>
+            <button type="button" class="btn" id="cookie-clear">清除</button>
+          </form>
+          <p id="cookie-msg" class="muted"></p>
+        </div>
+        <div class="card" id="card-tg-channels">
+          <h2>TG 频道列表</h2>
+          <p class="muted">Driver 搜索时使用的 Telegram 频道，一行一个频道名。未自定义时使用内置默认清单（2026-11-23 逐个验证的 147 个有效频道）。打开「只用夸克优先频道」时：默认清单直接用其中确认有夸克链接的 76 个；自定义清单则取它与这 76 个的交集，交集为空时退回自定义清单全量。</p>
+          <p>当前状态：<span id="channels-status">加载中…</span></p>
+          <textarea id="channels-input" rows="12" spellcheck="false"></textarea>
+          <p class="muted">共 <span id="channels-count">0</span> 个频道（输入时实时计数，保存时自动去重、去空行）。</p>
+          <form class="inline" id="channels-form">
+            <label class="muted"><input type="checkbox" id="channels-priority" style="width:auto"> 只用夸克优先频道（76）</label>
+            <button type="submit" class="btn btn-primary">保存频道列表</button>
+            <button type="button" class="btn" id="channels-reset">恢复默认（147）</button>
+          </form>
+          <p id="channels-msg" class="muted"></p>
         </div>
         <div class="card">
           <h2>登录账号</h2>
@@ -2064,6 +2387,57 @@ async function loadSettings() {
   document.getElementById('account-source').textContent = acc ? (acc.source === 'settings' ? '后台已修改' : '部署初始值') : '—';
   document.getElementById('side-user').textContent = uname ? '当前账号：' + uname : '';
   document.getElementById('topbar-user').textContent = uname || '';
+  renderCookieSettings(data.settings.quark_cookie);
+  renderChannelSettings(data.settings.tg_channels);
+}
+function renderCookieSettings(c) {
+  var st = document.getElementById('cookie-status');
+  var drv = document.getElementById('cookie-driver-status');
+  if (!c) { st.textContent = '—'; return; }
+  if (!c.enc_configured) {
+    st.innerHTML = '<span class="status-bad">功能未启用</span> — 服务端未配置 COOKIE_ENC_SECRET，无法加密保存（不会明文存储）。';
+    drv.textContent = '';
+    return;
+  }
+  if (!c.configured) {
+    st.textContent = '未配置 — Driver 拿不到 Cookie，只能走浏览器登录态等其他方式。';
+    drv.textContent = '';
+    return;
+  }
+  st.innerHTML = '<span class="status-ok">已配置</span>'
+    + (c.length ? '（长度 ' + c.length + ' 字符）' : '')
+    + (c.updated_at ? '，更新于 ' + fmtTime(c.updated_at) : '');
+  if (c.driver_status === 'invalid') {
+    drv.innerHTML = '<span class="status-bad">Driver 回报：Cookie 已失效</span>（' + fmtTime(c.driver_checked_at)
+      + '），请重新从夸克网页端复制最新 Cookie 粘贴保存。';
+  } else if (c.driver_status === 'ok') {
+    drv.innerHTML = '<span class="status-ok">Driver 回报：Cookie 有效</span>（' + fmtTime(c.driver_checked_at) + '）。';
+  } else {
+    drv.textContent = 'Driver 尚未回报过 Cookie 有效性。';
+  }
+}
+function countChannelsText() {
+  var lines = document.getElementById('channels-input').value.split(/[\\n,]+/);
+  var seen = {}, n = 0;
+  for (var i = 0; i < lines.length; i++) {
+    var name = lines[i].trim().replace(/^@+/, '');
+    if (!name) continue;
+    var k = name.toLowerCase();
+    if (seen[k]) continue;
+    seen[k] = 1; n++;
+  }
+  document.getElementById('channels-count').textContent = n;
+  return n;
+}
+function renderChannelSettings(t) {
+  var st = document.getElementById('channels-status');
+  if (!t) { st.textContent = '—'; return; }
+  document.getElementById('channels-input').value = (t.effective || []).join('\\n');
+  document.getElementById('channels-priority').checked = !!t.priority_only;
+  countChannelsText();
+  st.textContent = (t.custom ? '使用自定义清单（共 ' + t.base_count + ' 个）' : '使用默认清单（' + t.default_count + ' 个，2026-11-23 验证）')
+    + '；当前生效 ' + t.count + ' 个'
+    + (t.priority_only ? (t.priority_fallback ? '（优先开关已开，但与优先集无交集，已退回全量）' : '（仅夸克优先 ' + t.priority_count + ' 个）') : '');
 }
 document.getElementById('account-form').addEventListener('submit', async function (e) {
   e.preventDefault();
@@ -2107,6 +2481,60 @@ document.getElementById('tmdb-clear').addEventListener('click', async function (
     body: JSON.stringify({ clear_tmdb_api_key: true })
   });
   if (!r.ok) { alert('清除失败'); return; }
+  loadSettings();
+});
+document.getElementById('cookie-form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  var msg = document.getElementById('cookie-msg');
+  var v = document.getElementById('cookie-input').value.trim();
+  if (!v) { msg.textContent = '请先粘贴 Cookie'; return; }
+  var r = await fetch('/api/settings', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ quark_cookie: v })
+  });
+  var data = await r.json().catch(function () { return null; });
+  if (!r.ok) { msg.textContent = data && data.error ? data.error.message : '保存失败'; return; }
+  document.getElementById('cookie-input').value = '';
+  msg.textContent = '已加密保存。Driver 下次取配置时生效。';
+  loadSettings();
+});
+document.getElementById('cookie-clear').addEventListener('click', async function () {
+  if (!confirm('确定清除已保存的夸克 Cookie 吗？Driver 将无法再取到它。')) return;
+  var r = await fetch('/api/settings', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clear_quark_cookie: true })
+  });
+  if (!r.ok) { alert('清除失败'); return; }
+  document.getElementById('cookie-msg').textContent = '已清除。';
+  loadSettings();
+});
+document.getElementById('channels-input').addEventListener('input', countChannelsText);
+document.getElementById('channels-form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  var msg = document.getElementById('channels-msg');
+  var names = document.getElementById('channels-input').value.split(/[\\n,]+/)
+    .map(function (s) { return s.trim().replace(/^@+/, ''); }).filter(Boolean);
+  var payload = {
+    tg_channels: names,
+    tg_channels_priority_only: document.getElementById('channels-priority').checked
+  };
+  var r = await fetch('/api/settings', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  var data = await r.json().catch(function () { return null; });
+  if (!r.ok) { msg.textContent = data && data.error ? data.error.message : '保存失败'; return; }
+  msg.textContent = '已保存。Driver 下次取配置时生效。';
+  loadSettings();
+});
+document.getElementById('channels-reset').addEventListener('click', async function () {
+  if (!confirm('恢复为内置默认清单（147 个已验证频道）吗？自定义清单会被删除。')) return;
+  var r = await fetch('/api/settings', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ reset_tg_channels: true })
+  });
+  if (!r.ok) { alert('恢复失败'); return; }
+  document.getElementById('channels-msg').textContent = '已恢复默认清单。';
   loadSettings();
 });
 
@@ -2159,6 +2587,8 @@ export default {
         if (pathname === "/api/driver/progress" && req.method === "POST") return handleDriverProgress(req, store, env);
         if (pathname === "/api/driver/heartbeat" && req.method === "POST") return handleDriverHeartbeat(req, store);
         if (pathname === "/api/driver/logs" && req.method === "POST") return handleDriverLogs(req, store);
+        if (pathname === "/api/driver/config" && req.method === "GET") return handleDriverConfig(store, env);
+        if (pathname === "/api/driver/quark-status" && req.method === "POST") return handleDriverQuarkStatus(req, store);
         return err("not_found", "unknown driver endpoint", 404);
       }
 

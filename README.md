@@ -1,9 +1,11 @@
 # PanPilot
 
-> Status: v0.4 — **deployed 2026-11-25** via the Cloudflare API to https://panpilot.ttai.net
+> Status: v0.5 — **deployed 2026-11-25** via the Cloudflare API to https://panpilot.ttai.net
 > (verified live: D1 store, password login, Driver auth); source is developed in the
 > public repository below.
-> 状态：v0.4 — **已于 2026-11-25 经 Cloudflare API 部署上线**并完成线上验证；源码在本仓库公开开发。设计见 [DESIGN.md](./DESIGN.md)。
+> 状态：v0.5 — **已于 2026-11-25 经 Cloudflare API 部署上线**并完成线上验证；源码在本仓库公开开发。设计见 [DESIGN.md](./DESIGN.md)。
+> v0.5 新增：设置页可加密保存夸克 Cookie 供 Driver 取用转存（AES-GCM，见下方安全说明），
+> TG 频道列表可在设置页配置（默认预填 2026-11-23 验证的 147 个有效频道）。
 
 **Repository / 仓库：** https://github.com/ttainet/panpilot
 **Live / 正式域名：** https://panpilot.ttai.net
@@ -24,8 +26,13 @@ MoviePilot：用户只在网页上订阅电视剧/电影/综艺；搜索 TG 频�
 全部由外部 **Driver**（Muse 等 AI 代理，或用户自写的程序）通过 DESIGN.md
 定义的 Driver API 执行。
 
-**The control plane never stores any cloud-drive cookie or password.**
-**控制面不保存任何网盘 Cookie 或密码**，登录态只存在于 Driver 所在设备。
+**The control plane never stores any cloud-drive password.** A Quark cookie is
+stored **only if you paste one on the settings page**, and then only as
+AES-GCM ciphertext (key held in a Worker secret); web APIs never return it —
+only your Driver can fetch it. See the security notes below.
+**控制面不保存任何网盘密码。** 夸克 Cookie 仅在你于设置页主动粘贴时保存，且只存
+AES-GCM 密文（密钥在 Worker Secret 中）；网页接口永不返回，仅你的 Driver 可取用。
+详见下方安全须知。不填 Cookie 时，Driver 可继续用其所在设备上的登录态执行。
 
 ## 界面 | Web UI
 
@@ -92,6 +99,25 @@ see [DESIGN.md](./DESIGN.md). 完整设计（表结构、Driver API、状态机�
 - **Settings page （设置页 `/settings`)**: save/update/clear your **TMDB API Key**.
   It is stored in the D1 `settings` table and only ever shown masked (last 4 chars).
   可在设置页配置 TMDB API Key（存 settings 表，页面只显示末 4 位掩码，可更新/清除）。
+- **Quark Cookie （夸克 Cookie)**: the settings page can store your Quark cookie so
+  the Driver can call the Quark API directly. It is encrypted with **AES-GCM**
+  (key = Worker secret `COOKIE_ENC_SECRET`; the feature is disabled when that
+  secret is unset — there is no plaintext fallback). The settings API only ever
+  reports whether one is configured, when, its length, and the validity the
+  Driver last reported via `POST /api/driver/quark-status`. The Driver fetches
+  the decrypted cookie (plus the effective channel list) from
+  `GET /api/driver/config` (Bearer token, `Cache-Control: no-store`).
+  设置页可保存夸克 Cookie 供 Driver 直接调夸克接口转存：AES-GCM 加密存储（未配置
+  加密密钥时功能禁用、无明文兜底），页面只显示配置状态/长度/Driver 回报的有效性；
+  Driver 经 `GET /api/driver/config` 取回明文与生效频道清单。
+- **TG channels （TG 频道列表）**: the settings page edits the channel list the
+  Driver searches (one per line, deduped/validated on save, one-click reset).
+  Defaults are the 147 channels verified on 2026-11-23 (seed data in
+  `src/channels.ts`); a "priority only" switch narrows to the 76 channels
+  confirmed to post Quark links (for a custom list it intersects with those 76,
+  falling back to the full custom list if the intersection is empty).
+  设置页可编辑 Driver 搜索用的 TG 频道清单：默认预填 2026-11-23 逐个验证的 147 个
+  有效频道，可自定义/恢复默认；「只用夸克优先」开关对应其中 76 个确认有夸克链接的频道。
 - **Subscribe flow （选剧）**: on the home page, search TMDB (zh-CN) by title, pick a
   result, and the form is auto-filled with TMDB id, year, type, region category
   (mapped from `origin_country`: CN→国产剧， HK/TW→港台剧， JP→日剧， KR→韩剧， else→欧美剧）
@@ -108,6 +134,7 @@ npm install
 #   APP_PASSWORD=your-local-password
 #   DRIVER_TOKEN=your-local-driver-token
 #   SESSION_SECRET=your-local-session-secret   (optional)
+#   COOKIE_ENC_SECRET=<64 hex chars>           (optional; enables encrypted Quark cookie storage)
 #   CHECK_INTERVAL_HOURS=6
 npx wrangler d1 migrations apply panpilot --local   # local D1 schema
 npm run dev        # wrangler dev on http://localhost:8787
@@ -141,6 +168,11 @@ What the script does / 脚本做的事：
    generated `SESSION_SECRET` and `DRIVER_TOKEN`. The driver token is also
    written to `.driver-token` locally (mode 600, git-ignored) for Driver use.
    设置四个 Secret；随机生成的 Driver Token 另存本机 `.driver-token`。
+   For feature deploys that must keep live secrets, run the steps individually
+   (`--step migrate|bundle|upload`) plus `--step enc-secret`, which only
+   ensures `COOKIE_ENC_SECRET` exists (generating it solely when missing) and
+   never rotates the other secrets. 已有部署的功能升级用分步执行 + `--step enc-secret`
+   （仅补设缺失的 Cookie 加密密钥，绝不轮换已有 Secret）。
 4. Binds the hostname. Note: the Workers Custom Domains API rejected this
    account's API token (`10405 Method not allowed for this authentication
    scheme`), so the script falls back to the classic equivalent — a zone
@@ -176,7 +208,15 @@ git remote add origin https://github.com/ttainet/panpilot.git
 - `DRIVER_TOKEN` is separate from web credentials and can be rotated on its own.
 - The TMDB API Key saved on the settings page lives in your own D1 database and
   is only ever displayed masked; it is never committed to git.
-- Never store Quark/TG cookies in Workers, D1, git, or logs.
+- The Quark cookie (if you choose to save one) is stored in D1 **only as
+  AES-GCM ciphertext**; the decryption key is a separate Worker secret
+  (`COOKIE_ENC_SECRET`). If both the database and that secret leak, the cookie
+  must be considered leaked — treat a cookie like a login credential: never
+  paste it into chat, git, issues, or logs, and revoke it (log out / change
+  password on the Quark side) if you suspect exposure. Cookie saves, clears,
+  and Driver fetches are audit-logged as events only (never the value).
+  夸克 Cookie 只以 AES-GCM 密文存 D1、密钥为独立 Worker Secret；两者同时泄露即
+  等同 Cookie 泄露。Cookie 等同登录凭证，不要粘贴到聊天/git/日志中。
 
 ## License
 
