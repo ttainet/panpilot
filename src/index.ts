@@ -49,6 +49,14 @@
  * operating guide in three synced places: docs/AI_DRIVER_GUIDE.md (source),
  * AGENTS.md (concise), and GET /api/driver/agent-guide (served from
  * guide.ts, generated from the doc by scripts/gen-guide.mjs).
+ *
+ * v0.8: settings page is split into per-area tabs （账号 / 媒体信息 / 网盘 /
+ * 搜索源 / 入库目录 / Driver). Pure presentation change: panels are hidden
+ * with display:none (never removed), so unsaved form edits survive tab
+ * switches; the active tab is mirrored into the URL hash (#driver, ...) so
+ * refreshes and deep links restore it; tabs that need attention (TMDB key
+ * missing, Quark cookie missing/invalid) get a red dot on their label.
+ * No API, field, or behavior changes.
  */
 
 import {
@@ -87,7 +95,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "0.7.0";
+const VERSION = "0.8.0";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -2126,6 +2134,32 @@ const APP_CSS = `
   .tmdb-info .m { color: var(--pp-muted); font-size: .78rem; margin-top: .2rem; }
   .guide-card { border-color: rgba(240, 179, 92, .5); }
 
+  /* ---- settings tabs (v0.8) ---- */
+  .settings-tabs {
+    display: flex; gap: .3rem; margin-bottom: 1.2rem;
+    border-bottom: 1px solid var(--pp-border);
+    overflow-x: auto; overflow-y: hidden;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  .settings-tabs::-webkit-scrollbar { display: none; }
+  .settings-tab {
+    position: relative; flex: 0 0 auto; white-space: nowrap;
+    background: transparent; border: none; cursor: pointer;
+    color: var(--pp-muted); font-size: .97rem;
+    padding: .62rem .95rem; margin-bottom: -1px;
+    border-bottom: 2px solid transparent;
+  }
+  .settings-tab:hover { color: var(--pp-text); }
+  .settings-tab.active { color: #fff; font-weight: 600; border-bottom-color: var(--pp-accent); }
+  .tab-dot {
+    position: absolute; top: .42rem; right: .28rem;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--pp-red); box-shadow: 0 0 0 2px var(--pp-bg);
+  }
+  .tab-dot[hidden] { display: none; }
+  .settings-panel { display: none; }
+  .settings-panel.active { display: block; }
+
   /* ---- modal ---- */
   .modal-backdrop {
     position: fixed; inset: 0; background: rgba(4, 6, 10, .66);
@@ -2315,6 +2349,15 @@ function appHtml(initialView: string): string {
       </section>
 
       <section class="view" id="view-settings">
+        <div class="settings-tabs" role="tablist" aria-label="设置分类">
+          <button class="settings-tab" data-stab="account" role="tab">账号</button>
+          <button class="settings-tab" data-stab="tmdb" role="tab">媒体信息<span class="tab-dot" id="tab-dot-tmdb" hidden></span></button>
+          <button class="settings-tab" data-stab="quark" role="tab">网盘<span class="tab-dot" id="tab-dot-quark" hidden></span></button>
+          <button class="settings-tab" data-stab="channels" role="tab">搜索源</button>
+          <button class="settings-tab" data-stab="directories" role="tab">入库目录</button>
+          <button class="settings-tab" data-stab="driver" role="tab">Driver</button>
+        </div>
+        <div class="settings-panel" id="spanel-tmdb">
         <div class="card">
           <h2>TMDB</h2>
           <p class="muted">TMDB API Key 保存在服务端设置中（页面只显示末 4 位掩码），用于发现页的选剧搜索与元数据回填。Key 在 themoviedb.org 免费申请。</p>
@@ -2325,6 +2368,8 @@ function appHtml(initialView: string): string {
             <button type="button" class="btn" id="tmdb-clear">清除</button>
           </form>
         </div>
+        </div>
+        <div class="settings-panel" id="spanel-quark">
         <div class="card" id="card-quark-cookie">
           <h2>夸克网盘 Cookie</h2>
           <p class="muted">Driver 用它直接调用夸克接口转存。Cookie 以 <strong>AES-GCM 加密</strong>形式保存在服务端（密钥为 Worker Secret，页面与接口永不回显明文）；只有持有 Driver Token 的 Driver 能取回。Cookie 等同于登录凭证，请只在本页填写，不要发到聊天或代码仓库里。</p>
@@ -2337,6 +2382,8 @@ function appHtml(initialView: string): string {
           </form>
           <p id="cookie-msg" class="muted"></p>
         </div>
+        </div>
+        <div class="settings-panel" id="spanel-channels">
         <div class="card" id="card-tg-channels">
           <h2>TG 频道列表</h2>
           <p class="muted">Driver 搜索时使用的 Telegram 频道，一行一个频道名。未自定义时使用内置默认清单（2026-11-23 逐个验证的 147 个有效频道）。打开「只用夸克优先频道」时：默认清单直接用其中确认有夸克链接的 76 个；自定义清单则取它与这 76 个的交集，交集为空时退回自定义清单全量。</p>
@@ -2350,6 +2397,8 @@ function appHtml(initialView: string): string {
           </form>
           <p id="channels-msg" class="muted"></p>
         </div>
+        </div>
+        <div class="settings-panel" id="spanel-directories">
         <div class="card" id="card-directories">
           <h2>入库目录</h2>
           <p class="muted">Driver 转存入库时使用的网盘目录规范，分类判定以这里的映射为准（Driver 每轮从配置接口读取生效值）。默认值按夸克实际结构预填：电视剧与电影都在根目录下，日韩合并为「日韩剧」，国漫/纪录片/综艺都在电视剧下，电影分华语/外语/动画。映射一行一条，格式「代码=文件夹名」：地区代码为 TMDB 原产地代码（CN/JP/KR 等），* 表示其他地区；电影映射里 animation 表示动画电影；电视剧特殊分类的键为 animation_cn（国漫）/ documentary（纪录片）/ variety（综艺）。模板占位符：{title} {year} {season} {episode}，:02 表示两位零填充。</p>
@@ -2380,6 +2429,8 @@ function appHtml(initialView: string): string {
           </form>
           <p id="directories-msg" class="muted"></p>
         </div>
+        </div>
+        <div class="settings-panel" id="spanel-account">
         <div class="card">
           <h2>登录账号</h2>
           <p class="muted">当前登录用户名：<span id="account-username">…</span>（来源：<span id="account-source">…</span>）。初始账号密码来自部署时的 Secrets，在这里修改后以新账号为准（密码只存哈希）。修改须验证当前密码；保存后其他设备上的旧登录会失效，本浏览器会自动续上新登录。</p>
@@ -2392,6 +2443,8 @@ function appHtml(initialView: string): string {
           </form>
           <p id="account-msg" class="muted"></p>
         </div>
+        </div>
+        <div class="settings-panel" id="spanel-driver">
         <div class="card" id="card-driver-keys">
           <h2>Driver API Key</h2>
           <p class="muted">Driver 需要的一切凭据都从 PanPilot 取（夸克 Cookie、TMDB Key、频道清单），而取用前必须先凭 API Key 通过鉴权：请求头带 <code>Authorization: Bearer &lt;Key&gt;</code>，没有有效 Key 时所有 Driver 接口一律 401、拿不到任何数据。在这里可为每个 Driver 建独立 Key（建议一个 Driver 一个，名称写清是谁），也可重置（旧 Key 立即作废、生成新 Key）或吊销。Key 明文<strong>只在创建/重置时显示一次</strong>，服务端只保存它的 SHA-256 哈希，丢了只能重置。</p>
@@ -2415,6 +2468,7 @@ function appHtml(initialView: string): string {
         <div class="card">
           <h2>Driver</h2>
           <p class="muted">Driver 检查间隔：<span id="interval">…</span> 小时一轮（由 Worker 环境变量 CHECK_INTERVAL_HOURS 控制，默认 6）。Driver API 使用独立 API Key（见上方卡片），与网页登录互不影响。</p>
+        </div>
         </div>
       </section>
 
@@ -2483,10 +2537,39 @@ function switchView(name) {
   }
   document.getElementById('page-title').textContent = VIEW_TITLES[name];
   if (location.hash !== '#' + name) history.replaceState(null, '', '#' + name);
+  if (name === 'settings') switchSettingsTab(currentSettingsTab);
 }
 var navItems = document.querySelectorAll('.menu-item');
 for (var n = 0; n < navItems.length; n++) {
   navItems[n].addEventListener('click', function () { switchView(this.getAttribute('data-nav')); });
+}
+
+/* ---------- settings tabs (v0.8) ----------
+ * Panels are only hidden (display:none), never removed from the DOM, so
+ * unsaved edits in one tab (channel list, directory maps, ...) survive
+ * switching to another tab and back. The active tab is mirrored into the
+ * URL hash (#driver etc.) so refreshes and deep links land on the same tab. */
+var SETTINGS_TABS = ['account', 'tmdb', 'quark', 'channels', 'directories', 'driver'];
+var currentSettingsTab = 'account';
+function switchSettingsTab(name, updateHash) {
+  if (SETTINGS_TABS.indexOf(name) < 0) name = 'account';
+  currentSettingsTab = name;
+  for (var i = 0; i < SETTINGS_TABS.length; i++) {
+    document.getElementById('spanel-' + SETTINGS_TABS[i]).classList.toggle('active', SETTINGS_TABS[i] === name);
+  }
+  var tabs = document.querySelectorAll('.settings-tab');
+  for (var j = 0; j < tabs.length; j++) {
+    var on = tabs[j].getAttribute('data-stab') === name;
+    tabs[j].classList.toggle('active', on);
+    tabs[j].setAttribute('aria-selected', on ? 'true' : 'false');
+  }
+  if (updateHash !== false && location.hash !== '#' + name) {
+    history.replaceState(null, '', '#' + name);
+  }
+}
+var stabEls = document.querySelectorAll('.settings-tab');
+for (var ti = 0; ti < stabEls.length; ti++) {
+  stabEls[ti].addEventListener('click', function () { switchSettingsTab(this.getAttribute('data-stab')); });
 }
 
 /* ---------- subscriptions rendering ---------- */
@@ -2670,7 +2753,7 @@ document.getElementById('tmdb-form').addEventListener('submit', async function (
       guide.innerHTML = '<div class="card guide-card"><h3>TMDB 还没有配置</h3>'
         + '<p class="muted">选剧搜索需要先在「设置」页保存 TMDB API Key（themoviedb.org 免费申请）。配置好后回到这里搜索即可；也可以先用下方表单手动添加订阅。</p>'
         + '<button class="btn btn-primary" id="guide-go-settings">去设置页配置</button></div>';
-      document.getElementById('guide-go-settings').addEventListener('click', function () { switchView('settings'); });
+      document.getElementById('guide-go-settings').addEventListener('click', function () { switchView('settings'); switchSettingsTab('tmdb'); });
     } else {
       alert(data && data.error ? data.error.message : 'TMDB 搜索失败');
     }
@@ -2723,6 +2806,10 @@ async function loadSettings() {
   var t = data.settings.tmdb_api_key;
   document.getElementById('tmdb-status').textContent =
     t.configured ? '已配置（' + t.masked + '）' : '未配置 — 选剧搜索不可用，仍可手动填写订阅';
+  document.getElementById('tab-dot-tmdb').hidden = !!t.configured;
+  var cq = data.settings.quark_cookie || {};
+  document.getElementById('tab-dot-quark').hidden =
+    !(!cq.enc_configured || !cq.configured || cq.driver_status === 'invalid');
   document.getElementById('interval').textContent = data.settings.check_interval_hours;
   var acc = data.settings.account;
   var uname = acc ? acc.username : '';
@@ -3068,6 +3155,7 @@ var initial = document.body.getAttribute('data-initial-view') || 'dashboard';
 if (location.hash) {
   var h = location.hash.slice(1);
   if (VIEWS.indexOf(h) >= 0) initial = h;
+  else if (SETTINGS_TABS.indexOf(h) >= 0) { initial = 'settings'; currentSettingsTab = h; }
 }
 switchView(initial);
 loadSettings();

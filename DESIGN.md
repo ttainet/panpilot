@@ -1,7 +1,12 @@
-# PanPilot 设计稿 v0.7（已部署上线）
+# PanPilot 设计稿 v0.8（已部署上线）
 
-> 状态：v0.7 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
+> 状态：v0.8 已于 **2026-11-25 经 Cloudflare API 部署到 https://panpilot.ttai.net** 并完成
 > 线上验证（health 为 store=d1、登录与 Driver 鉴权正常）。本文档描述目标架构与接口契约。
+>
+> v0.8 变更：设置页按功能域拆成 Tab（账号 / 媒体信息 / 网盘 / 搜索源 / 入库目录 / Driver），
+> 面板仅以 display:none 隐藏（未保存编辑切走不丢），激活 Tab 同步到 URL hash，
+> 需关注状态（TMDB 未配置、Cookie 未配置/已失效）在页签上以红点提示。纯前端呈现
+> 调整，不改任何接口、字段与行为。
 >
 > v0.7 变更（用户拍板）：(1) **入库目录成为一等设置**（settings 键 `directories`，
 > 默认值与用户夸克真实结构一致：根「电影电视剧」下只有电视剧/电影两夹；电视剧下
