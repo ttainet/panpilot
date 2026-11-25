@@ -72,7 +72,11 @@ PanPilot 是一个影视订阅**控制面**（Cloudflare Workers + D1）。用�
 
 订阅对象关键字段：`id, title, original_title, year, tmdb_id, media_type
 (tv|movie|variety), region, season, total_episodes, quality_pref, mode
-(manual|auto), status, target_dir, next_check_at`。
+(manual|auto), status, target_dir, next_check_at`。另外 pending 的每条
+订阅还附带两个画质字段（v1.0）：`quality` 是该订阅的清晰度覆盖
+（`2160p|1080p|720p`，为 null 表示跟随全局），`quality_profile` 是
+**已合并好的生效画质档案**（全局档案 + 该订阅覆盖），步骤 7 选源时
+直接用它，不要自己再合并。
 
 ## 3. 执行配置：`GET /api/driver/config` 一次取齐
 
@@ -84,7 +88,8 @@ PanPilot 是一个影视订阅**控制面**（Cloudflare Workers + D1）。用�
   "tg_channels_priority_only": false,
   "tg_channels_priority_fallback": false,
   "check_interval_hours": 6,
-  "directories": { … }          // 入库目录设置，见 §5
+  "directories": { … },         // 入库目录设置，见 §5
+  "quality": { … }              // 全局画质偏好档案，见步骤 7（pending 每条订阅另附合并后的 quality_profile，以那个为准）
 }
 ```
 
@@ -163,24 +168,71 @@ pending 给的 `missing_episodes`——用户可能在夸克 App 里手动增删
 
 收集候选：分享链接/码、来源频道、帖子链接、原始标题、标注的画质与大小。
 
-### 步骤 7 候选评分与异常检查
+### 步骤 7 候选筛选与评分（两段式：先硬过滤，后打分）
 
-对每个候选先打开分享（用 §6 的 share 接口列文件），再打分：
+选源规则的数据来源：pending 每条订阅附带的 **`quality_profile`**
+（已合并订阅覆盖的生效档案；config 的 `quality` 是全局档案，仅作
+参考，以 `quality_profile` 为准）。档案字段：
 
-- **集号解析**：从文件名解析季/集（`S01E05`、`EP05`、`第5集`、`05.` 等），
-  得到覆盖集号集。**只关心覆盖真实缺集的候选**；一集都不覆盖的直接淘汰。
-- **大小异常**：单集大小与同分享内相邻集差一个数量级（如别人 800MB 它
-  58MB），或小到不合常理 → 该集**跳过**并在候选的 `anomaly_note` 注明
-  （如 `E05 仅 58MB`），不要把异常文件入库。
+```jsonc
+{
+  "preferred_resolution": "1080p",  // 首选清晰度：2160p | 1080p | 720p | any
+  "allow_fallback": true,           // 找不到首选清晰度时是否允许降级
+  "exclude_remux": true,            // 排除蓝光原盘 / REMUX
+  "exclude_cam": true,              // 排除枪版 CAM / TS / TC
+  "prefer_h265": true,              // 同清晰度优先 H.265 / HEVC
+  "max_episode_gb": 0,              // 单集大小上限（GB），0 = 不限
+  "exclude_keywords": []            // 自定义排除关键词
+}
+```
+
+对每个候选先打开分享（用 §6 的 share 接口列文件），然后：
+
+#### 第一段：硬过滤（命中任一直接淘汰，不进入打分）
+
+- **集号不覆盖**：解析文件名得到覆盖集号集（`S01E05`、`EP05`、`第5集`、
+  `05.` 等），一集都不覆盖真实缺集的淘汰。
+- **蓝光原盘**（`exclude_remux` 为 true 时）：候选标题/文件名含
+  `REMUX`、`蓝光原盘`、`BD-Remux`、`Blu-ray 原盘`、原盘 ISO 等原盘
+  特征 → 淘汰。注意区分：`BluRay` 转压（非原盘）不在此列，它在
+  打分段有自己的来源优先级。
+- **枪版**（`exclude_cam` 为 true 时）：含 `CAM`、`TS`、`TC`、`HDTS`、
+  `HDTC`、`枪版` 等特征 → 淘汰。
+- **自定义关键词**：`exclude_keywords` 任一命中候选标题或文件名
+  （不区分大小写）→ 淘汰。
+- **大小超限**（`max_episode_gb` > 0 时）：单集文件大小超过上限
+  （电影按整个文件计）→ 该文件淘汰；整份分享的对应集都超限时
+  整个候选淘汰。
+- **清晰度不符**（`allow_fallback` 为 false 且 `preferred_resolution`
+  不是 `any` 时）：候选清晰度不等于首选 → 淘汰。宁可本轮不转，
+  等下一轮更好的源。
+- **大小异常**：单集大小与同分享内相邻集差一个数量级（如别人 800MB
+  它 58MB），或小到不合常理 → 该集**跳过**并在候选的
+  `anomaly_note` 注明（如 `E05 仅 58MB`），不要把异常文件入库。
+
+#### 第二段：打分排序（在通过硬过滤的候选里选最优）
+
+- **已入库规格最优先**：本季已有入库文件时，与已入库规格（分辨率/
+  编码/HDR 形式）一致的候选排第一——**档案让位于已入库规格**
+  （同季不混版规则不变，见 §5.4）。档案只决定「还没有任何已入库
+  集」时的选源方向。
+- **清晰度**：与 `preferred_resolution` 一致最高分；`allow_fallback`
+  为 true 时，升档（如首选 1080p、候选 2160p）次之，降级再次之
+  且按差距递减（一档差如 2160p→1080p 高于两档差如 2160p→720p）。
+- **编码**：`prefer_h265` 为 true 时，同清晰度下 H.265 / HEVC /
+  x265 加权高于 H.264 / AVC / x264。
+- **来源**：固定优先级 **WEB-DL > 蓝光转压（BluRay，非原盘）>
+  HDTV**。
+- **同分 tie-break**：体积更接近该清晰度常见单集大小的优先
+  （明显偏大可能注水、明显偏小可能压过头；结合大小异常规则
+  判断），其次来源频道可信度、覆盖缺集数。
 - **多版本整包**：一个分享里有多个画质子夹（如 4K / 4K DV / 4K HDR /
-  4K SDR 各一份全集）时，**只选一个子夹**——优先与已入库文件规格
-  （分辨率/编码/HDR 形式）一致的那版，其次按订阅 `quality_pref`。
-  绝不整包转存（可能几百 GB）。
-- **同集多源**：规格与已入库一致优先；其次总分（覆盖缺集数、大小合理性、
-  画质、来源频道可信度）。
-- 把候选（含评分与异常说明）`POST /api/driver/candidates` 回报。
-- **manual 模式**：回报后订阅会转 `awaiting_confirm`，**停在这里等用户
-  在网页确认，不要擅自转存**。auto 模式：选最高分候选继续步骤 8。
+  4K SDR 各一份全集）时，**只选一个子夹**：按上面顺序选最优的那版
+  （已入库规格 > 档案打分）。绝不整包转存（可能几百 GB）。
+
+把候选（含评分与异常说明）`POST /api/driver/candidates` 回报。
+**manual 模式**：回报后订阅会转 `awaiting_confirm`，**停在这里等用户
+在网页确认，不要擅自转存**。auto 模式：选最高分候选继续步骤 8。
 
 ### 步骤 8 选集转存到目标 Season 夹
 
@@ -406,7 +458,9 @@ pending 给的 `missing_episodes`——用户可能在夸克 App 里手动增删
 
 - 同一季内已入库的集是某种规格（如 4K、或 1080p、或某 HDR 形式）时，
   后续补集**优先选同规格**的候选文件/子夹；规格以分辨率、编码、
-  HDR 形式综合判断。
+  HDR 形式综合判断。**画质档案（`quality_profile`，见步骤 7）让位于
+  已入库规格**：哪怕档案首选 1080p，本季已入了 2160p 的集，补集仍
+  按 2160p 找；档案只在整季尚无已入库集时决定选源方向。
 - 整包多版本分享（多个画质子夹各含全集）**只转选中的一个子夹**里
   的缺集文件，**禁止整包转存**。
 - 本轮选定的规格写进 progress 的 note 或 logs（如

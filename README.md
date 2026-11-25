@@ -1,8 +1,12 @@
 # PanPilot
 
-> Status: v0.9. Deploy it to your own Cloudflare account and your own domain —
+> Status: v1.0. Deploy it to your own Cloudflare account and your own domain —
 > see [Deployment](#部署--deployment) below. Design: [DESIGN.md](./DESIGN.md).
-> 状态：v0.9。部署到你自己的 Cloudflare 账号与域名，步骤见下方[部署](#部署--deployment)。设计见 [DESIGN.md](./DESIGN.md)。
+> 状态：v1.0。部署到你自己的 Cloudflare 账号与域名，步骤见下方[部署](#部署--deployment)。设计见 [DESIGN.md](./DESIGN.md)。
+> v1.0 变更：画质偏好系统——设置页新增「画质偏好」Tab 维护全局档案（首选清晰度、
+> 是否允许降级、排除蓝光原盘/枪版、优先 H.265、单集大小上限、自定义排除关键词），
+> 单条订阅可只覆盖首选清晰度；Driver 选源改为两段式（先按档案硬过滤、再打分，
+> 已入库规格优先于档案），pending 直接下发合并后的生效档案。
 > v0.9 变更：AI Driver 手册的「目录与命名规范」重写为可直接执行的决策顺序与精确
 > 模板（先盘点复用已有剧名夹、季集解析、正反例、字幕跟随、同季不混版本、不确定
 > 就停）；`directories` 新增电影/综艺命名模板（movie_name_template /

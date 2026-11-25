@@ -69,6 +69,19 @@
  * editable on the settings page, returned by GET /api/driver/config, and
  * backfilled from defaults when an older stored settings object lacks
  * them (no error).
+ *
+ * v1.0: quality preference system. A global profile (settings key
+ * `quality`, defaults in quality.ts: preferred resolution 1080p,
+ * fallback allowed, REMUX + CAM excluded, H.265 preferred, optional
+ * per-episode size cap and custom exclude keywords) is edited on a new
+ * 画质偏好 settings tab and shipped to Drivers via GET /api/driver/config.
+ * A subscription may override ONLY the preferred resolution (migration
+ * 0004 adds `subscriptions.quality`: 2160p/1080p/720p, NULL = follow the
+ * global profile); GET /api/driver/pending attaches the merged effective
+ * profile as `quality_profile` to each subscription so Drivers never
+ * merge themselves. The guide's candidate selection becomes two-stage:
+ * hard filters from the profile, then scoring (already-stored season
+ * spec still outranks the profile — no mixing within a season).
  */
 
 import {
@@ -77,6 +90,13 @@ import {
   validateDirectories,
   type DirectorySettings,
 } from "./directories";
+import {
+  normalizeQualityOverride,
+  qualityProfileFor,
+  resolveQuality,
+  validateQuality,
+  type QualityProfile,
+} from "./quality";
 import { AI_DRIVER_GUIDE_MD } from "./guide";
 
 import { DEFAULT_TG_CHANNELS, PRIORITY_TG_CHANNELS } from "./channels";
@@ -107,7 +127,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "0.9.1";
+const VERSION = "1.0.0";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -133,6 +153,10 @@ export interface Subscription {
   season?: number;
   total_episodes?: number;
   quality_pref?: string;
+  /** v1.0: per-subscription preferred-resolution override
+   *  ("2160p" | "1080p" | "720p"); absent/null = follow the global
+   *  quality profile. Distinct from the legacy free-form quality_pref. */
+  quality?: string | null;
   /** Raw TMDB poster path (e.g. /abc.jpg); UI prefixes the image CDN host. */
   poster_path?: string;
   overview?: string;
@@ -726,6 +750,7 @@ function rowToSub(r: Row): Subscription {
   if (r.season != null) sub.season = Number(r.season);
   if (r.total_episodes != null) sub.total_episodes = Number(r.total_episodes);
   if (r.quality_pref != null) sub.quality_pref = String(r.quality_pref);
+  if (r.quality != null) sub.quality = String(r.quality);
   if (r.poster_path != null) sub.poster_path = String(r.poster_path);
   if (r.overview != null) sub.overview = String(r.overview);
   if (r.rating != null) sub.rating = Number(r.rating);
@@ -766,7 +791,7 @@ function rowToDriverKey(r: Row, withHash: boolean): DriverKey | DriverKeyRecord 
 
 const SUB_COLUMNS = [
   "id", "title", "original_title", "year", "tmdb_id", "media_type", "region",
-  "season", "total_episodes", "quality_pref", "poster_path", "overview", "rating",
+  "season", "total_episodes", "quality_pref", "quality", "poster_path", "overview", "rating",
   "mode", "status", "target_dir",
   "next_check_at", "last_checked_at", "last_error", "created_at", "updated_at",
 ] as const;
@@ -775,7 +800,7 @@ function subValues(s: Subscription): unknown[] {
   return [
     s.id, s.title, s.original_title ?? null, s.year ?? null, s.tmdb_id ?? null,
     s.media_type, s.region ?? null, s.season ?? null, s.total_episodes ?? null,
-    s.quality_pref ?? null, s.poster_path ?? null, s.overview ?? null, s.rating ?? null,
+    s.quality_pref ?? null, s.quality ?? null, s.poster_path ?? null, s.overview ?? null, s.rating ?? null,
     s.mode, s.status, s.target_dir ?? null,
     s.next_check_at ?? null, s.last_checked_at ?? null, s.last_error ?? null,
     s.created_at, s.updated_at,
@@ -1051,6 +1076,10 @@ async function handleListSubs(store: Store): Promise<Response> {
 async function handleCreateSub(req: Request, store: Store): Promise<Response> {
   const input = await body<Partial<Subscription>>(req);
   if (!input?.title) return err("bad_request", "title is required", 400);
+  // v1.0: the optional resolution override must be a known value;
+  // absent/empty means "follow the global quality profile".
+  const q = normalizeQualityOverride(input.quality);
+  if (q.error) return err("bad_request", q.error, 400);
   const t = now();
   const sub: Subscription = {
     id: uid(),
@@ -1063,6 +1092,7 @@ async function handleCreateSub(req: Request, store: Store): Promise<Response> {
     season: input.season,
     total_episodes: input.total_episodes,
     quality_pref: input.quality_pref,
+    quality: q.value,
     poster_path: typeof input.poster_path === "string" && input.poster_path ? input.poster_path : undefined,
     overview: typeof input.overview === "string" && input.overview ? input.overview : undefined,
     rating: typeof input.rating === "number" && Number.isFinite(input.rating) ? input.rating : undefined,
@@ -1090,6 +1120,13 @@ async function handlePatchSub(req: Request, store: Store, id: string): Promise<R
   // Whitelist mutable fields so clients cannot rewrite ids/timestamps.
   const { status, mode, quality_pref, region, season, total_episodes, target_dir, next_check_at, tmdb_id, year, poster_path, overview, rating } = patch;
   const clean: Partial<Subscription> = { status, mode, quality_pref, region, season, total_episodes, target_dir, next_check_at, tmdb_id, year, poster_path, overview, rating };
+  // v1.0: quality override — a resolution sets it, null/"" clears it back
+  // to "follow the global profile"; anything else is a 400.
+  if (patch.quality !== undefined) {
+    const q = normalizeQualityOverride(patch.quality);
+    if (q.error) return err("bad_request", q.error, 400);
+    clean.quality = q.value;
+  }
   for (const k of Object.keys(clean) as (keyof typeof clean)[]) if (clean[k] === undefined) delete clean[k];
   const sub = await store.updateSubscription(id, clean);
   return sub ? json({ subscription: sub }) : err("not_found", "subscription not found", 404);
@@ -1152,6 +1189,10 @@ function clampLease(seconds: number | undefined): number {
 async function handleDriverPending(url: URL, store: Store): Promise<Response> {
   const limit = Math.min(Number(url.searchParams.get("limit") ?? 20) || 20, 100);
   const due = await store.listPendingSubscriptions(limit);
+  // v1.0: attach each subscription's EFFECTIVE quality profile (global
+  // profile with the subscription's resolution override merged in), so
+  // the Driver applies it as-is and never merges anything itself.
+  const globalQuality = await getEffectiveQuality(store);
   const out = [];
   for (const sub of due) {
     const episodes = await store.getEpisodes(sub.id);
@@ -1166,7 +1207,12 @@ async function handleDriverPending(url: URL, store: Store): Promise<Response> {
       missing = [];
       for (let ep = 1; ep <= sub.total_episodes; ep++) if (!storedSet.has(ep)) missing.push(ep);
     }
-    out.push({ ...sub, stored_episodes: stored, missing_episodes: missing });
+    out.push({
+      ...sub,
+      stored_episodes: stored,
+      missing_episodes: missing,
+      quality_profile: qualityProfileFor(globalQuality, sub.quality),
+    });
   }
   return json({ subscriptions: out });
 }
@@ -1406,6 +1452,8 @@ async function handleGetSettings(store: Store, env: Env): Promise<Response> {
   const eff = await getEffectiveChannels(store);
   const directories = await getEffectiveDirectories(store);
   const directoriesCustom = (await store.getSetting(SETTING_DIRECTORIES)) != null;
+  const quality = await getEffectiveQuality(store);
+  const qualityCustom = (await store.getSetting(SETTING_QUALITY)) != null;
   return json({
     settings: {
       tmdb_api_key: { configured: !!key, masked: key ? maskKey(key) : null },
@@ -1434,6 +1482,9 @@ async function handleGetSettings(store: Store, env: Env): Promise<Response> {
       // v0.7: effective library directory layout (defaults when not customised).
       directories,
       directories_custom: directoriesCustom,
+      // v1.0: effective global quality profile (defaults when not customised).
+      quality,
+      quality_custom: qualityCustom,
     },
   });
 }
@@ -1509,6 +1560,8 @@ async function handleUpdateSettings(req: Request, store: Store, env: Env): Promi
     tg_channels_priority_only?: boolean;
     directories?: unknown;
     reset_directories?: boolean;
+    quality?: unknown;
+    reset_quality?: boolean;
   }>(req);
   if (!input) return err("bad_request", "invalid JSON body", 400);
   let changed = false;
@@ -1520,6 +1573,14 @@ async function handleUpdateSettings(req: Request, store: Store, env: Env): Promi
     const v = validateDirectories(input.directories);
     if (!v.value) return err("bad_request", `入库目录设置不合法：${v.error ?? "unknown error"}`, 400);
     directoriesToSave = v.value;
+  }
+
+  // --- Quality profile (v1.0): same up-front validation pattern. ---
+  let qualityToSave: QualityProfile | null = null;
+  if (input.quality !== undefined) {
+    const v = validateQuality(input.quality);
+    if (!v.value) return err("bad_request", `画质偏好不合法：${v.error ?? "unknown error"}`, 400);
+    qualityToSave = v.value;
   }
 
   if (input.clear_tmdb_api_key) {
@@ -1598,8 +1659,22 @@ async function handleUpdateSettings(req: Request, store: Store, env: Env): Promi
     changed = true;
   }
 
+  // --- Quality profile (v1.0): save the validated object / reset. ---
+  if (input.reset_quality) {
+    await store.deleteSetting(SETTING_QUALITY);
+    await store.addLog({ level: "info", event: "quality_reset" });
+    changed = true;
+  } else if (qualityToSave) {
+    await store.setSetting(SETTING_QUALITY, JSON.stringify(qualityToSave));
+    await store.addLog({
+      level: "info", event: "quality_saved",
+      detail: JSON.stringify({ preferred_resolution: qualityToSave.preferred_resolution }),
+    });
+    changed = true;
+  }
+
   if (!changed) {
-    return err("bad_request", "nothing to update: provide tmdb_api_key / quark_cookie / tg_channels / tg_channels_priority_only / directories (or the clear/reset flags)", 400);
+    return err("bad_request", "nothing to update: provide tmdb_api_key / quark_cookie / tg_channels / tg_channels_priority_only / directories / quality (or the clear/reset flags)", 400);
   }
   return handleGetSettings(store, env);
 }
@@ -1764,6 +1839,13 @@ async function getEffectiveDirectories(store: Store): Promise<DirectorySettings>
   return resolveDirectories(await store.getSetting(SETTING_DIRECTORIES));
 }
 
+const SETTING_QUALITY = "quality"; // JSON QualityProfile; absent = DEFAULT_QUALITY (v1.0)
+
+/** Effective global quality profile: stored JSON merged over the defaults. */
+async function getEffectiveQuality(store: Store): Promise<QualityProfile> {
+  return resolveQuality(await store.getSetting(SETTING_QUALITY));
+}
+
 /** GET /api/driver/config — everything a Driver needs for a round. No-store. */
 async function handleDriverConfig(store: Store, env: Env): Promise<Response> {
   const cookie = await getQuarkCookiePlaintext(store, env);
@@ -1774,6 +1856,9 @@ async function handleDriverConfig(store: Store, env: Env): Promise<Response> {
   // v0.7: the effective library directory layout ships with the config so
   // the Driver files into the user's real Quark structure (see guide §5).
   const directories = await getEffectiveDirectories(store);
+  // v1.0: the global quality profile ships too; per-subscription pending
+  // entries carry their merged `quality_profile` (see guide §7).
+  const quality = await getEffectiveQuality(store);
   await store.addLog({
     level: "info", event: "driver_config_fetched",
     detail: JSON.stringify({
@@ -1790,6 +1875,7 @@ async function handleDriverConfig(store: Store, env: Env): Promise<Response> {
       tg_channels_priority_fallback: eff.priority_fallback,
       check_interval_hours: checkIntervalSeconds(env) / 3600,
       directories,
+      quality,
     }),
     { status: 200, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } },
   );
@@ -2355,6 +2441,12 @@ function appHtml(initialView: string): string {
               <option value="manual">手动确认</option>
               <option value="auto">自动转存</option>
             </select>
+            <select name="quality" id="f-quality" title="画质偏好（清晰度覆盖）">
+              <option value="">画质：跟随全局</option>
+              <option value="2160p">画质：优先 4K</option>
+              <option value="1080p">画质：优先 1080p</option>
+              <option value="720p">画质：优先 720p</option>
+            </select>
             <button type="submit" class="btn btn-primary">添加订阅</button>
           </form>
         </div>
@@ -2367,6 +2459,7 @@ function appHtml(initialView: string): string {
           <button class="settings-tab" data-stab="quark" role="tab">网盘<span class="tab-dot" id="tab-dot-quark" hidden></span></button>
           <button class="settings-tab" data-stab="channels" role="tab">搜索源</button>
           <button class="settings-tab" data-stab="directories" role="tab">入库目录</button>
+          <button class="settings-tab" data-stab="quality" role="tab">画质偏好</button>
           <button class="settings-tab" data-stab="driver" role="tab">Driver</button>
         </div>
         <div class="settings-panel" id="spanel-tmdb">
@@ -2445,6 +2538,40 @@ function appHtml(initialView: string): string {
             </div>
           </form>
           <p id="directories-msg" class="muted"></p>
+        </div>
+        </div>
+        <div class="settings-panel" id="spanel-quality">
+        <div class="card" id="card-quality">
+          <h2>画质偏好</h2>
+          <p class="muted">Driver 选源时使用的全局画质档案：先按「硬过滤」淘汰命中的候选，再按优先级打分排序。单条订阅可只覆盖首选清晰度（在订阅卡片或添加订阅时选择），其余项仍以这里为准；同一季已有入库文件时，已入库规格优先于本档案（同季不混版本）。</p>
+          <p>当前状态：<span id="quality-status">加载中…</span></p>
+          <form id="quality-form">
+            <div style="display:flex;flex-wrap:wrap;gap:.55rem;align-items:center">
+              <label class="muted">首选清晰度
+                <select id="q-resolution">
+                  <option value="2160p">2160p（4K）</option>
+                  <option value="1080p">1080p</option>
+                  <option value="720p">720p</option>
+                  <option value="any">不限（any）</option>
+                </select>
+              </label>
+              <label class="muted">单集大小上限（GB） <input id="q-max-gb" type="number" min="0" max="1024" step="0.5" style="width:100px"></label>
+            </div>
+            <p class="muted" style="margin:.4rem 0 0">单集上限填 0 表示不限；超过上限的候选直接淘汰（电影按整个文件计）。</p>
+            <div style="display:flex;flex-wrap:wrap;gap:1rem;align-items:center;margin-top:.7rem">
+              <label class="muted"><input type="checkbox" id="q-fallback" style="width:auto"> 允许降级（找不到首选清晰度时接受更低清晰度）</label>
+              <label class="muted"><input type="checkbox" id="q-exclude-remux" style="width:auto"> 排除蓝光原盘 / REMUX</label>
+              <label class="muted"><input type="checkbox" id="q-exclude-cam" style="width:auto"> 排除枪版（CAM / TS / TC）</label>
+              <label class="muted"><input type="checkbox" id="q-prefer-h265" style="width:auto"> 同清晰度优先 H.265 / HEVC</label>
+            </div>
+            <p class="muted" style="margin:.7rem 0 .3rem">自定义排除关键词（一行一个，命中候选标题或文件名即淘汰，如发布组名、水印字样）</p>
+            <textarea id="q-exclude-keywords" rows="4" spellcheck="false"></textarea>
+            <div style="display:flex;flex-wrap:wrap;gap:.55rem;align-items:center;margin-top:.7rem">
+              <button type="submit" class="btn btn-primary">保存画质偏好</button>
+              <button type="button" class="btn" id="quality-reset">恢复默认</button>
+            </div>
+          </form>
+          <p id="quality-msg" class="muted"></p>
         </div>
         </div>
         <div class="settings-panel" id="spanel-account">
@@ -2566,7 +2693,7 @@ for (var n = 0; n < navItems.length; n++) {
  * unsaved edits in one tab (channel list, directory maps, ...) survive
  * switching to another tab and back. The active tab is mirrored into the
  * URL hash (#driver etc.) so refreshes and deep links land on the same tab. */
-var SETTINGS_TABS = ['account', 'tmdb', 'quark', 'channels', 'directories', 'driver'];
+var SETTINGS_TABS = ['account', 'tmdb', 'quark', 'channels', 'directories', 'quality', 'driver'];
 var currentSettingsTab = 'account';
 function switchSettingsTab(name, updateHash) {
   if (SETTINGS_TABS.indexOf(name) < 0) name = 'account';
@@ -2604,10 +2731,18 @@ function subCard(s) {
   var tags = '<span class="tag">' + mediaLabel(s.media_type) + '</span>'
     + (s.region ? '<span class="tag">' + esc(s.region) + '</span>' : '')
     + (s.season != null && s.media_type !== 'movie' ? '<span class="tag">第 ' + s.season + ' 季</span>' : '')
+    + (s.quality ? '<span class="tag">' + esc(s.quality) + '</span>' : '')
     + (s.rating ? '<span class="tag tag-rate">★ ' + Number(s.rating).toFixed(1) + '</span>' : '');
   var pauseBtn = s.status === 'paused'
     ? '<button class="btn btn-ghost" data-act="resume" data-id="' + s.id + '">恢复</button>'
     : '<button class="btn btn-ghost" data-act="pause" data-id="' + s.id + '">暂停</button>';
+  var qualityEdit = '<select data-qedit="' + s.id + '" title="画质偏好：只覆盖首选清晰度，其余跟随全局档案">'
+    + '<option value=""' + (!s.quality ? ' selected' : '') + '>画质跟随全局</option>'
+    + ['2160p', '1080p', '720p'].map(function (r) {
+        return '<option value="' + r + '"' + (s.quality === r ? ' selected' : '') + '>'
+          + (r === '2160p' ? '优先 4K' : '优先 ' + r) + '</option>';
+      }).join('')
+    + '</select>';
   return '<article class="sub-card">' + posterHtml(s, 'poster')
     + '<div class="sub-body">'
     + '<div class="sub-title">' + esc(s.title) + (s.year ? ' <span class="sub-year">' + s.year + '</span>' : '') + '</div>'
@@ -2615,7 +2750,7 @@ function subCard(s) {
     + '<div class="progress"><div class="progress-bar" style="width:' + p.pct + '%"></div></div>'
     + '<div class="sub-meta"><span>' + p.text + '</span>' + badge(s.status) + '</div>'
     + '<div class="sub-next">下次检查：' + fmtTime(s.next_check_at) + '</div>'
-    + '<div class="sub-actions">' + pauseBtn
+    + '<div class="sub-actions">' + pauseBtn + qualityEdit
     + '<button class="btn btn-danger" data-act="delete" data-id="' + s.id + '">删除</button></div>'
     + '</div></article>';
 }
@@ -2672,6 +2807,16 @@ document.getElementById('sub-grid').addEventListener('click', async function (e)
   }
   loadSubs();
 });
+document.getElementById('sub-grid').addEventListener('change', async function (e) {
+  var sel = e.target.closest('select[data-qedit]');
+  if (!sel) return;
+  var r = await api('/api/subscriptions/' + sel.getAttribute('data-qedit'), {
+    method: 'PATCH', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ quality: sel.value === '' ? null : sel.value })
+  });
+  if (!r.ok) { alert('画质偏好保存失败'); }
+  loadSubs();
+});
 
 /* ---------- discover / TMDB ---------- */
 var modalItem = null;
@@ -2705,10 +2850,14 @@ async function openDetail(item) {
     seasonOptions += '<option value="' + seasons[i].season + '" data-eps="' + seasons[i].episode_count + '">第 '
       + seasons[i].season + ' 季（' + seasons[i].episode_count + ' 集）</option>';
   }
+  var qualitySelect = '<label class="muted">画质</label><select id="m-quality"><option value="">跟随全局</option>'
+    + '<option value="2160p">优先 4K</option><option value="1080p">优先 1080p</option><option value="720p">优先 720p</option></select>';
   var seasonRow = d.media_type === 'tv'
     ? '<form class="inline"><label class="muted">订阅季</label><select id="m-season">' + seasonOptions + '</select>'
-      + '<label class="muted">模式</label><select id="m-mode"><option value="manual">手动确认</option><option value="auto">自动转存</option></select></form>'
-    : '<form class="inline"><label class="muted">模式</label><select id="m-mode"><option value="manual">手动确认</option><option value="auto">自动转存</option></select></form>';
+      + '<label class="muted">模式</label><select id="m-mode"><option value="manual">手动确认</option><option value="auto">自动转存</option></select>'
+      + qualitySelect + '</form>'
+    : '<form class="inline"><label class="muted">模式</label><select id="m-mode"><option value="manual">手动确认</option><option value="auto">自动转存</option></select>'
+      + qualitySelect + '</form>';
   box.innerHTML = '<div class="modal-head">' + poster
     + '<div style="flex:1;min-width:0"><div style="font-size:1.15rem;font-weight:700">' + esc(d.title)
     + (d.year ? ' <span class="sub-year">' + d.year + '</span>' : '') + '</div>'
@@ -2731,6 +2880,7 @@ async function subscribeFromModal() {
     title: d.title, original_title: d.original_title || undefined,
     year: d.year, tmdb_id: d.tmdb_id, media_type: d.media_type,
     region: d.region || undefined, mode: document.getElementById('m-mode').value,
+    quality: document.getElementById('m-quality').value || undefined,
     poster_path: d.poster_path || undefined, overview: d.overview || undefined,
     rating: typeof d.rating === 'number' ? d.rating : undefined
   };
@@ -2837,6 +2987,7 @@ async function loadSettings() {
   renderCookieSettings(data.settings.quark_cookie);
   renderChannelSettings(data.settings.tg_channels);
   renderDirectorySettings(data.settings.directories, data.settings.directories_custom);
+  renderQualitySettings(data.settings.quality, data.settings.quality_custom);
   loadDriverKeys();
 }
 function renderCookieSettings(c) {
@@ -2991,6 +3142,56 @@ document.getElementById('directories-reset').addEventListener('click', async fun
   });
   if (!r.ok) { alert('恢复失败'); return; }
   document.getElementById('directories-msg').textContent = '已恢复默认目录设置。';
+  loadSettings();
+});
+
+/* ---------- settings: quality profile (v1.0) ---------- */
+function collectQuality() {
+  var kws = document.getElementById('q-exclude-keywords').value.split(/[\\n,]+/)
+    .map(function (s) { return s.trim(); }).filter(Boolean);
+  var maxGb = Number(document.getElementById('q-max-gb').value);
+  return {
+    preferred_resolution: document.getElementById('q-resolution').value,
+    allow_fallback: document.getElementById('q-fallback').checked,
+    exclude_remux: document.getElementById('q-exclude-remux').checked,
+    exclude_cam: document.getElementById('q-exclude-cam').checked,
+    prefer_h265: document.getElementById('q-prefer-h265').checked,
+    max_episode_gb: isFinite(maxGb) && maxGb >= 0 ? maxGb : 0,
+    exclude_keywords: kws
+  };
+}
+function renderQualitySettings(q, custom) {
+  var st = document.getElementById('quality-status');
+  if (!q) { st.textContent = '—'; return; }
+  document.getElementById('q-resolution').value = q.preferred_resolution || '1080p';
+  document.getElementById('q-fallback').checked = q.allow_fallback !== false;
+  document.getElementById('q-exclude-remux').checked = !!q.exclude_remux;
+  document.getElementById('q-exclude-cam').checked = !!q.exclude_cam;
+  document.getElementById('q-prefer-h265').checked = !!q.prefer_h265;
+  document.getElementById('q-max-gb').value = q.max_episode_gb || 0;
+  document.getElementById('q-exclude-keywords').value = (q.exclude_keywords || []).join(NL);
+  st.textContent = custom ? '使用自定义设置' : '使用默认设置（1080p 优先、排除原盘与枪版、优先 H.265）';
+}
+document.getElementById('quality-form').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  var msg = document.getElementById('quality-msg');
+  var r = await fetch('/api/settings', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ quality: collectQuality() })
+  });
+  var data = await r.json().catch(function () { return null; });
+  if (!r.ok) { msg.textContent = data && data.error ? data.error.message : '保存失败'; return; }
+  msg.textContent = '已保存。Driver 下次取配置时生效。';
+  loadSettings();
+});
+document.getElementById('quality-reset').addEventListener('click', async function () {
+  if (!confirm('恢复为默认画质偏好吗？自定义设置会被删除。')) return;
+  var r = await fetch('/api/settings', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ reset_quality: true })
+  });
+  if (!r.ok) { alert('恢复失败'); return; }
+  document.getElementById('quality-msg').textContent = '已恢复默认画质偏好。';
   loadSettings();
 });
 

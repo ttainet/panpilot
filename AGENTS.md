@@ -28,14 +28,19 @@
 2. `POST /api/driver/claim` 认领；**409 就跳过**，不要抢。
 3. 读订阅的 TMDB 信息（剧名/年份/季/总集数/缺集），缺失时用 TMDB Key 补查。
 4. `GET /api/driver/config` 一次取齐：夸克 Cookie、TMDB Key、频道清单、
-   `directories` 目录设置。
+   `directories` 目录设置、全局画质档案 `quality`（选源以每条订阅
+   pending 附带的合并后 `quality_profile` 为准，见第 7 步）。
 5. 用 Cookie 列夸克目录**先盘点**：按 base→类型层→各分类夹逐层找已有
    「剧名 (年份)」夹并复用，算出真实缺集；集齐则回写 completed/ended 收尾。
 6. 按 config 的频道清单搜索（PanSou 或逐个 `t.me/s/<频道>?q=剧名`），
    只找 pan.quark.cn 分享。
-7. 候选评分：解析集号只取缺集；单集大小异常跳过并注明；多版本整包
-   只选一个与已入库规格一致的子夹；`POST /api/driver/candidates` 回报。
-   **manual 模式回报后停下等用户确认，绝不擅自转存。**
+7. 候选两段式筛选（按订阅的 `quality_profile`）：**先硬过滤**——
+   原盘/REMUX、枪版、自定义排除关键词、单集超大小上限、不允许降级时
+   清晰度不符，命中任一直接淘汰，大小异常的集跳过并注明；
+   **后打分**——已入库规格最优先（同季不混版，档案让位于已入库
+   规格），其次清晰度贴合首选、H.265 加权、来源 WEB-DL > 蓝光转压
+   > HDTV；多版本整包只选一个子夹。`POST /api/driver/candidates`
+   回报。**manual 模式回报后停下等用户确认，绝不擅自转存。**
 8. 用 Cookie 调夸克接口选集转存（share/token → share/detail 挑 fid →
    share/save 到目标 Season 夹 → task 轮询），只转缺集。
 9. 按 `directories` 模板重命名，再列目录复核，然后

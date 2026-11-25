@@ -1,7 +1,15 @@
-# PanPilot 设计稿 v0.9
+# PanPilot 设计稿 v1.0
 
-> 状态：v0.9。本文档描述目标架构与接口契约；部署方式见 README 的部署章节
+> 状态：v1.0。本文档描述目标架构与接口契约；部署方式见 README 的部署章节
 > （部署到你自己的 Cloudflare 账号与域名）。
+>
+> v1.0 变更：画质偏好系统。全局档案存 settings 键 `quality`（src/quality.ts：
+> preferred_resolution / allow_fallback / exclude_remux / exclude_cam /
+> prefer_h265 / max_episode_gb / exclude_keywords），设置页新增「画质偏好」
+> Tab；订阅级覆盖只到清晰度一维（迁移 0004 新增 `subscriptions.quality`，
+> 空 = 跟随全局）；`GET /api/driver/config` 下发全局档案，`GET
+> /api/driver/pending` 每条订阅附带合并后的 `quality_profile`；手册选源
+> 改为两段式（硬过滤 → 打分），已入库规格优先于档案（同季不混版不变）。
 >
 > v0.9 变更：AI Driver 手册（docs/AI_DRIVER_GUIDE.md §5）把目录与命名规则重写为
 > 明确无歧义的决策顺序 + 精确模板 + 正反例（先盘点复用已有剧名夹、季集解析规则、
