@@ -39,6 +39,23 @@ PanPilot 是一个影视订阅**控制面**（Cloudflare Workers + D1）。用�
 - 给自己选一个稳定的 `driver_id`（如 `claude-main`、`home-nas-01`），
   claim / heartbeat / logs 全程用同一个，便于用户排查。
 
+### 调用约定：User-Agent 与重试（所有 Driver API 请求都适用）
+
+- **必须带浏览器 User-Agent**：实例部署在 Cloudflare 之后，脚本/库的
+  默认 UA（如 `python-requests`、裸 `curl` 的 UA）会被 Cloudflare 边缘
+  以 **1010** 错误直接拦截——这与 Key 是否有效**无关**，Key 再对也会被
+  拦。所有 `/api/driver/*` 请求固定带一个常见浏览器 User-Agent
+  （如当前主流 Chrome 的 UA 字符串），整轮不要换来换去。
+  收到 1010 时先检查 UA，不要去怀疑 Key；401 才是鉴权问题。
+- **瞬时断连要退避重试**：PanPilot API 偶发连接被中途断开
+  （`RemoteDisconnected`、连接重置、超时等），属瞬时故障，实测一轮
+  里出现数次并不罕见。任何 Driver API 请求失败时，**先退避重试
+  2–3 次（间隔约 2 秒、5 秒递增）再判定失败**；不要一失败就放弃
+  正在处理的订阅、更不要把瞬时断连误报成订阅错误或 Cookie 失效。
+  重试时保持请求内容不变（claim 的重试注意：若上一次 claim 其实
+  已在服务端成功、只是响应丢了，重试会返回 409 或同一任务，
+  按返回结果处理，不要重复转存）。
+
 ## 2. 接口清单（Driver API）
 
 | 方法 & 路径 | 用途 |
@@ -131,8 +148,8 @@ pending 给的 `missing_episodes`——用户可能在夸克 App 里手动增删
    消失的标 missing）。
 
 **真实缺集 = 1..total_episodes − 实际已存集号集**。缺集为空 → progress 回写
-`subscription_status: "completed"`（TMDB 已完结则 `"ended"`），结束本条，
-不要再去搜索。
+`subscription_status: "completed"`；**先查 TMDB 状态，已 Ended/Canceled
+则改用 `"ended"`**（判定口径见步骤 9 第 4 点），结束本条，不要再去搜索。
 
 ### 步骤 6 搜索频道找分享
 
@@ -181,15 +198,21 @@ pending 给的 `missing_episodes`——用户可能在夸克 App 里手动增删
 1. 转存完成后，按 §5.4 的命名规范逐个重命名（**保留原扩展名**，
    如 `.mkv`）：电视剧用 `directories.episode_name_template`、电影用
    `movie_name_template`、综艺用 `variety_name_template`；字幕文件
-   跟随视频改同基础名（规则见 §5.4）。
-2. **再列一次目标文件夹复核**：新集确实在位、文件名规范、大小与源一致。
-   复核不过不要标 stored，如实标 failed 并写 note。
+   跟随视频改同基础名（规则见 §5.4）。改名偶发被夸克以 **14014**
+   拒绝时按 §7 的重试规则处理，不要改名字绕过。
+2. **再列一次目标文件夹复核（定量标准）**：不只是「文件在」——逐集
+   比对目标文件的**大小与源分享清单中该集的大小**，**逐字节一致**
+   才算入库成功；同时核对在位集号齐全、文件名符合模板。大小不一致
+   的集**不要标 stored**，标 failed 并在 progress 的 note 里**逐集
+   点名**（如 `E07 大小不一致：源 812345678 / 目标 812000000`）。
 3. `POST /api/driver/progress` 逐集回写：
    `{season, episode, status: "stored", source_share_code, source_channel,
    quark_fid, file_name, file_size}`。
 4. 订阅状态：仍有缺集 → `subscription_status: "partial_stored"`（服务端会
    自动排下一轮 `next_check_at = +check_interval_hours`）；全部集齐 →
-   `"completed"`，且 TMDB 状态为已完结（Ended/Canceled）时用 `"ended"`。
+   `"completed"`；**回写前再用 TMDB Key 查一次该剧的 TMDB 状态**，
+   若已 **Ended/Canceled 且本季集数已齐全**，用 `"ended"` 代替
+   `"completed"`，让订阅进入终态关闭、不再被下一轮重复拉起。
    带终态的 progress 会自动关闭本条 task。
 
 ### 步骤 10 心跳与收尾
@@ -440,6 +463,14 @@ pending 给的 `missing_episodes`——用户可能在夸克 App 里手动增删
   （`POST /api/driver/logs` 写 `candidate_dead` 事件），换下一个候选；
   同一分享不要重复尝试超过一次。全候选皆失效 → progress 回写
   `error` + note，订阅会按 next_check_at 下轮再来。
+- **改名被 14014 拒绝**：夸克 `file/rename` 偶发返回 **14014
+  「illegal text」**——这是夸克内容检查的误伤，完全合法的模板文件名
+  也会中招（实测正常剧集名就被拒过）。遇到时**等待约 3 秒后重试
+  1–2 次**，通常即成功。**不要**为了绕过它而改用其他名字——命名
+  必须服从 §5.4 模板。重试仍失败才跳过该文件的改名（文件本身已
+  入库，不要因此把整集标 failed），并在 progress note / logs /
+  向用户的汇报里**点名该集**（如 `E24 改名 14014 重试 2 次仍失败，
+  保留原名 <原文件名>`），等人工处理或下一轮再改。
 - **租约过期**：heartbeat 返回 404（任务不存在）或发现租约已过期 →
   本条订阅立即停手，回到步骤 1 重新 pending + claim；若重新 claim
   返回 409，说明别人接手了，**彻底放弃本条**，不要并行处理同一订阅。
