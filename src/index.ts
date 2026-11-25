@@ -92,6 +92,14 @@
  * skipped without re-opening; single-source whole-season coverage is
  * preferred and a size anomaly disqualifies only that episode, not
  * the whole source. No functional changes.
+ *
+ * v1.0.2: guide-only update — two rules from the third real Driver run
+ * （两京十五日 inventory run): when a season's stored episodes already
+ * mix specs, fill-in spec follows the majority spec (ties: the spec of
+ * the run ending at the highest episode number), noted in progress,
+ * stored episodes are never replaced; episodes aired within 48h with
+ * no source anywhere are marked 待源 (pending-source) — no error, no
+ * candidate downgrade — and retried next round. No functional changes.
  */
 
 import {
@@ -137,7 +145,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "1.0.1";
+const VERSION = "1.0.2";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
