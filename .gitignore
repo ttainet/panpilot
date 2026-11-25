@@ -1,0 +1,8 @@
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+.driver-token
+scripts/deploy-state.json
+dist/
+*.log

@@ -1,0 +1,35 @@
+# PanPilot — Cloudflare Workers 配置
+# 已于 2026-11-25 经 Cloudflare API 部署（scripts/deploy.py，非 wrangler deploy）；
+# 本文件保留作配置记录与本地 wrangler dev 使用。
+name = "panpilot"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+workers_dev = true
+
+# 正式域名：panpilot.ttai.net（已绑定）
+# 绑定方式：ttai.net Zone 的 Worker 路由 panpilot.ttai.net/* → 本脚本 + 一条橙云
+# 代理的占位 DNS A 记录。未用 Workers 自定义域 API：该端点对本账号的 Account
+# API Token 返回 10405（Method not allowed for this authentication scheme）。
+# routes = [{ pattern = "panpilot.ttai.net", custom_domain = true }]
+
+# D1 数据库：部署前先执行
+#   wrangler d1 create panpilot
+# 把输出的 database_id 填到下面，并执行 migrations：
+#   wrangler d1 migrations apply panpilot --remote
+# 本地 `wrangler dev` 会使用本地 D1（先执行 wrangler d1 migrations apply panpilot --local）。
+# 只要存在 DB binding，Worker 默认走 D1；无 binding 时才回退内存存储，
+# 健康检查会如实返回 store: "d1" 或 "memory"，不会假装已连接 D1。
+[[d1_databases]]
+binding = "DB"
+database_name = "panpilot"
+database_id = "32a76201-1a07-4102-aaae-4d8a2e804d7c" # 2026-11-25 经 API 创建
+migrations_dir = "migrations"
+
+# 密钥不要写在这里，用 wrangler secret put 注入：
+#   wrangler secret put APP_USERNAME     # 网页端登录用户名
+#   wrangler secret put APP_PASSWORD     # 网页端登录密码
+#   wrangler secret put DRIVER_TOKEN     # Driver 的 Bearer Token（与网页登录独立）
+#   wrangler secret put SESSION_SECRET   # 可选：会话 Cookie 签名密钥（默认由 APP_PASSWORD 派生）
+# 本地开发把假值写进 .dev.vars（已 gitignore），不要提交真实密钥。
+[vars]
+CHECK_INTERVAL_HOURS = "6"
