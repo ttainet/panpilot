@@ -100,6 +100,145 @@ function setBtnLoading(btn, loading) {
   btn.classList.toggle('is-loading', !!loading);
 }
 
+/* ---------- Custom Select & Popover (replaces ugly native dropdown list) ---------- */
+var activePopSel = null;
+var activePopFocusIdx = -1;
+function getPopover() { return document.getElementById('pp-popover'); }
+function syncCustomSelect(sel) {
+  if (!sel || !sel._csWrap) return;
+  var opt = sel.options[sel.selectedIndex] || sel.options[0];
+  var label = opt ? opt.text : '';
+  sel._csLabel.textContent = label;
+  sel._csTrigger.disabled = !!sel.disabled;
+  sel._csTrigger.title = sel.title || label;
+}
+function closePopover() {
+  var pop = getPopover();
+  if (!pop || pop.hidden) return;
+  pop.hidden = true;
+  pop.innerHTML = '';
+  if (activePopSel && activePopSel._csTrigger) {
+    activePopSel._csTrigger.setAttribute('aria-expanded', 'false');
+  }
+  activePopSel = null;
+  activePopFocusIdx = -1;
+}
+function highlightPopOption(idx) {
+  var pop = getPopover();
+  var items = pop.querySelectorAll('.pp-pop-opt');
+  if (!items.length) return;
+  if (idx < 0) idx = items.length - 1;
+  if (idx >= items.length) idx = 0;
+  activePopFocusIdx = idx;
+  for (var i = 0; i < items.length; i++) {
+    items[i].classList.toggle('is-focused', i === idx);
+  }
+  if (items[idx] && items[idx].scrollIntoView) items[idx].scrollIntoView({ block: 'nearest' });
+}
+function openPopover(sel) {
+  var pop = getPopover();
+  if (!pop || !sel || sel.disabled) return;
+  if (activePopSel === sel && !pop.hidden) { closePopover(); return; }
+  closePopover();
+  activePopSel = sel;
+  var opts = [];
+  for (var i = 0; i < sel.options.length; i++) {
+    var o = sel.options[i];
+    if (o.disabled) continue;
+    var isSel = i === sel.selectedIndex;
+    if (isSel) activePopFocusIdx = opts.length;
+    opts.push('<button type="button" class="pp-pop-opt' + (isSel ? ' is-selected' : '') + '" role="option" aria-selected="' + (isSel ? 'true' : 'false') + '" data-val="' + esc(o.value) + '">'
+      + '<span>' + esc(o.text) + '</span>'
+      + '<span class="pp-pop-check">' + ICONS.check + '</span></button>');
+  }
+  pop.innerHTML = opts.join('');
+  pop.hidden = false;
+  sel._csTrigger.setAttribute('aria-expanded', 'true');
+  var rect = sel._csTrigger.getBoundingClientRect();
+  var minW = Math.max(rect.width, 136);
+  pop.style.minWidth = minW + 'px';
+  pop.style.maxWidth = Math.min(340, window.innerWidth - 16) + 'px';
+  var popH = Math.min(pop.scrollHeight || 200, 260);
+  var popW = Math.max(pop.offsetWidth || minW, minW);
+  var spaceBelow = window.innerHeight - rect.bottom - 8;
+  var top = spaceBelow >= popH || spaceBelow >= rect.top
+    ? Math.min(window.innerHeight - popH - 8, rect.bottom + 5)
+    : Math.max(8, rect.top - popH - 5);
+  var left = Math.min(window.innerWidth - popW - 8, Math.max(8, rect.left));
+  pop.style.top = top + 'px';
+  pop.style.left = left + 'px';
+  highlightPopOption(activePopFocusIdx >= 0 ? activePopFocusIdx : 0);
+}
+function enhanceSelects(root) {
+  var list = (root || document).querySelectorAll('select');
+  for (var i = 0; i < list.length; i++) {
+    (function (sel) {
+      if (sel._csWrap) { syncCustomSelect(sel); return; }
+      var wrap = document.createElement('div');
+      wrap.className = 'cs-wrap' + (sel.hasAttribute('data-qedit') ? ' is-sm' : '');
+      sel.parentNode.insertBefore(wrap, sel);
+      wrap.appendChild(sel);
+      sel.classList.add('cs-native');
+      sel.tabIndex = -1;
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'cs-trigger';
+      btn.setAttribute('aria-haspopup', 'listbox');
+      btn.setAttribute('aria-expanded', 'false');
+      var lbl = document.createElement('span');
+      lbl.className = 'cs-label';
+      var caret = document.createElement('span');
+      caret.className = 'cs-caret';
+      caret.innerHTML = ICONS.chevron;
+      btn.appendChild(lbl);
+      btn.appendChild(caret);
+      wrap.appendChild(btn);
+      sel._csWrap = wrap;
+      sel._csTrigger = btn;
+      sel._csLabel = lbl;
+      syncCustomSelect(sel);
+      btn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        openPopover(sel);
+      });
+      btn.addEventListener('keydown', function (e) {
+        var pop = getPopover();
+        var isOpen = !pop.hidden && activePopSel === sel;
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+          e.preventDefault();
+          if (!isOpen) { openPopover(sel); return; }
+          highlightPopOption(activePopFocusIdx + (e.key === 'ArrowDown' ? 1 : -1));
+        } else if (e.key === 'Enter' && isOpen) {
+          e.preventDefault();
+          var focused = pop.querySelector('.pp-pop-opt.is-focused');
+          if (focused) focused.click();
+        }
+      });
+      sel.addEventListener('change', function () { syncCustomSelect(sel); });
+    })(list[i]);
+  }
+}
+document.getElementById('pp-popover').addEventListener('click', function (e) {
+  var optBtn = e.target.closest('.pp-pop-opt');
+  if (!optBtn || !activePopSel) return;
+  var sel = activePopSel;
+  var val = optBtn.getAttribute('data-val');
+  var changed = sel.value !== val;
+  sel.value = val;
+  syncCustomSelect(sel);
+  closePopover();
+  if (changed) sel.dispatchEvent(new Event('change', { bubbles: true }));
+});
+document.addEventListener('click', function (e) {
+  var pop = getPopover();
+  if (!pop || pop.hidden) return;
+  if (pop.contains(e.target)) return;
+  if (activePopSel && activePopSel._csTrigger && activePopSel._csTrigger.contains(e.target)) return;
+  closePopover();
+});
+window.addEventListener('resize', closePopover);
+window.addEventListener('scroll', closePopover, true);
+
 /* ---------- Custom Confirm Modal (replaces window.confirm) ---------- */
 var confirmResolver = null;
 function closeConfirm(result) {
@@ -155,6 +294,7 @@ document.getElementById('theme-toggle-m').addEventListener('click', toggleTheme)
 /* ---------- Navigation & Keyboard Shortcuts ---------- */
 var currentView = 'dashboard';
 function switchView(name) {
+  closePopover();
   if (VIEWS.indexOf(name) < 0) name = 'dashboard';
   currentView = name;
   for (var i = 0; i < VIEWS.length; i++) {
@@ -188,6 +328,8 @@ document.getElementById('recent-view-all').addEventListener('click', function ()
 
 document.addEventListener('keydown', function (e) {
   if (e.key === 'Escape') {
+    var pop = getPopover();
+    if (pop && !pop.hidden) { closePopover(); return; }
     var cbd = document.getElementById('confirm-backdrop');
     if (cbd && !cbd.hidden) { closeConfirm(false); return; }
     var mbd = document.getElementById('modal-backdrop');
@@ -326,10 +468,12 @@ function progressOf(s) {
 function subCard(s) {
   var p = progressOf(s);
   var done = isFinishedSub(s);
-  var tags = '<span class="tag">' + mediaLabel(s.media_type) + '</span>'
-    + (s.region ? '<span class="tag">' + esc(s.region) + '</span>' : '')
-    + (s.season != null && s.media_type !== 'movie' ? '<span class="tag">第 ' + s.season + ' 季</span>' : '')
-    + '<span class="tag">' + (s.mode === 'auto' ? '自动转存' : '手动确认') + '</span>';
+  var attrList = [
+    mediaLabel(s.media_type),
+    s.region || '',
+    (s.season != null && s.media_type !== 'movie') ? ('第 ' + s.season + ' 季') : '',
+    s.mode === 'auto' ? '自动转存' : '手动确认'
+  ].filter(Boolean);
   var pauseBtn = s.status === 'paused'
     ? '<button type="button" class="btn btn-sm" data-act="resume" data-id="' + s.id + '">' + ICONS.play + '<span>恢复</span></button>'
     : '<button type="button" class="btn btn-sm" data-act="pause" data-id="' + s.id + '">' + ICONS.pause + '<span>暂停</span></button>';
@@ -347,6 +491,7 @@ function subCard(s) {
     ? '<div class="sub-err-note" title="' + esc(s.last_error) + '">' + esc(s.last_error) + '</div>'
     : '';
   return '<article class="sub-card' + (s.status === 'error' ? ' has-error' : '') + '">'
+    + '<div class="sub-main">'
     + '<div class="poster-wrap" data-detail="' + s.id + '">'
     + posterImgHtml(s, 'poster')
     + (s.rating ? '<span class="poster-score num">★ ' + Number(s.rating).toFixed(1) + '</span>' : '')
@@ -356,18 +501,20 @@ function subCard(s) {
     + '<div class="sub-title" data-detail="' + s.id + '">' + esc(s.title) + (s.year ? ' <span class="sub-year num">' + s.year + '</span>' : '') + '</div>'
     + badge(s.status)
     + '</div>'
-    + '<div class="tag-row">' + tags + '</div>'
-    + '<div class="progress"><div class="progress-bar' + (done || p.pct >= 100 ? ' progress-bar-done' : '') + '" style="width:' + p.pct + '%"></div></div>'
+    + '<div class="sub-attrs">' + esc(attrList.join(' · ')) + '</div>'
+    + '<div class="sub-progress-wrap">'
     + '<div class="sub-meta"><span class="num">' + p.text + '</span><span class="num">' + p.pct + '%</span></div>'
+    + '<div class="progress"><div class="progress-bar' + (done || p.pct >= 100 ? ' progress-bar-done' : '') + '" style="width:' + p.pct + '%"></div></div>'
     + '<div class="sub-next">' + timeLine + '</div>'
     + errLine
-    + '<div class="sub-actions">'
+    + '</div></div></div>'
+    + '<div class="sub-footer">'
     + pauseBtn
     + qualityEdit
-    + '<button type="button" class="btn btn-ghost btn-icon" data-detail="' + s.id + '" title="查看详情与集进度" aria-label="查看详情">' + ICONS.info + '</button>'
     + '<span class="spacer"></span>'
-    + '<button type="button" class="btn btn-danger btn-icon" data-act="delete" data-id="' + s.id + '" title="删除订阅" aria-label="删除订阅">' + ICONS.trash + '</button>'
-    + '</div></div></article>';
+    + '<button type="button" class="btn btn-ghost btn-sm" data-detail="' + s.id + '" title="查看详情与集进度">' + ICONS.info + '<span>详情</span></button>'
+    + '<button type="button" class="btn btn-icon sub-del-btn" data-act="delete" data-id="' + s.id + '" title="删除订阅" aria-label="删除订阅">' + ICONS.trash + '</button>'
+    + '</div></article>';
 }
 
 var subGroup = 'active';
@@ -430,6 +577,7 @@ function renderSubs() {
     grid.style.display = '';
     empty.hidden = true;
     grid.innerHTML = list.map(subCard).join('');
+    enhanceSelects(grid);
     return;
   }
   grid.style.display = 'none';
@@ -585,8 +733,8 @@ async function openSubDetail(id) {
       + '<div class="tag-row" style="margin-top:.55rem">' + tags + '</div>'
       + '<div class="form-grid-2" style="margin-top:.75rem">'
       + '<div class="field"><label class="field-label" for="sd-mode">执行模式</label>'
-      + '<select id="sd-mode"><option value="manual"' + (s.mode === 'manual' ? ' selected' : '') + '>手动确认</option>'
-      + '<option value="auto"' + (s.mode === 'auto' ? ' selected' : '') + '>自动转存</option></select></div>'
+      + '<select id="sd-mode"><option value="auto"' + (s.mode === 'auto' ? ' selected' : '') + '>自动转存</option>'
+      + '<option value="manual"' + (s.mode === 'manual' ? ' selected' : '') + '>手动确认</option></select></div>'
       + '<div class="field"><label class="field-label" for="sd-quality">画质覆盖</label>'
       + '<select id="sd-quality"><option value=""' + (!s.quality ? ' selected' : '') + '>跟随全局</option>'
       + '<option value="2160p"' + (s.quality === '2160p' ? ' selected' : '') + '>优先 4K</option>'
@@ -601,12 +749,13 @@ async function openSubDetail(id) {
       + '<button type="button" class="btn" id="sd-logs">查看日志</button>'
       + '<button type="button" class="btn btn-primary" id="sd-save">保存更改</button>'
       + '</div>';
+    enhanceSelects(box);
 
     document.getElementById('sd-logs').addEventListener('click', function () {
       closeModal();
       logSubId = s.id;
       var sel = document.getElementById('log-sub-filter');
-      if (sel) sel.value = s.id;
+      if (sel) { sel.value = s.id; syncCustomSelect(sel); }
       switchView('logs');
     });
     document.getElementById('sd-save').addEventListener('click', async function () {
@@ -691,6 +840,7 @@ document.getElementById('sub-grid').addEventListener('change', async function (e
   var sel = e.target.closest('select[data-qedit]');
   if (!sel) return;
   sel.disabled = true;
+  syncCustomSelect(sel);
   try {
     var r = await api('/api/subscriptions/' + sel.getAttribute('data-qedit'), {
       method: 'PATCH', headers: { 'content-type': 'application/json' },
@@ -700,6 +850,7 @@ document.getElementById('sub-grid').addEventListener('change', async function (e
     else { toast('已更新画质偏好', 'success'); }
   } finally {
     sel.disabled = false;
+    syncCustomSelect(sel);
   }
   loadSubs();
 });
@@ -775,6 +926,7 @@ function renderLogSubFilter() {
       + esc(subsCache[i].title) + '</option>';
   }
   sel.innerHTML = html;
+  syncCustomSelect(sel);
 }
 var logLvlBtns = document.querySelectorAll('[data-loglevel]');
 for (var li = 0; li < logLvlBtns.length; li++) {
@@ -799,7 +951,7 @@ document.getElementById('log-list').addEventListener('click', function (e) {
 
 /* ---------- Discover / TMDB ---------- */
 var modalDetails = null;
-function closeModal() { document.getElementById('modal-backdrop').hidden = true; }
+function closeModal() { closePopover(); document.getElementById('modal-backdrop').hidden = true; }
 document.getElementById('modal-close-x').addEventListener('click', closeModal);
 document.getElementById('modal-backdrop').addEventListener('click', function (e) {
   if (e.target === this) closeModal();
@@ -830,7 +982,7 @@ async function openDetail(item) {
       + seasons[i].season + ' 季（' + seasons[i].episode_count + ' 集）</option>';
   }
   var modeField = '<div class="field"><label class="field-label" for="m-mode">执行模式</label>'
-    + '<select id="m-mode"><option value="manual">手动确认</option><option value="auto">自动转存</option></select></div>';
+    + '<select id="m-mode"><option value="auto" selected>自动转存</option><option value="manual">手动确认</option></select></div>';
   var qualityField = '<div class="field"><label class="field-label" for="m-quality">画质覆盖</label>'
     + '<select id="m-quality"><option value="">跟随全局</option><option value="2160p">优先 4K</option>'
     + '<option value="1080p">优先 1080p</option><option value="720p">优先 720p</option></select></div>';
@@ -850,6 +1002,7 @@ async function openDetail(item) {
     + (d.overview ? '<div class="modal-section"><div class="modal-section-title">剧情简介</div><p class="overview">' + esc(d.overview) + '</p></div>' : '')
     + '<div class="modal-actions"><button type="button" class="btn" id="m-cancel">取消</button>'
     + '<button type="button" class="btn btn-primary" id="m-subscribe">确认订阅</button></div>';
+  enhanceSelects(box);
   document.getElementById('m-cancel').addEventListener('click', closeModal);
   document.getElementById('m-subscribe').addEventListener('click', subscribeFromModal);
 }
@@ -969,6 +1122,7 @@ document.getElementById('add-form').addEventListener('submit', async function (e
     if (!r.ok) { toast(data && data.error ? data.error.message : '添加失败', 'error'); return; }
     toast('已添加订阅「' + (payload.title || '') + '」', 'success');
     e.target.reset();
+    enhanceSelects(e.target);
     await loadSubs();
     switchSubGroup('active');
     switchView('subscriptions');
@@ -1207,6 +1361,7 @@ function renderQualitySettings(q, custom) {
   var st = document.getElementById('quality-status');
   if (!q) { st.textContent = '—'; return; }
   document.getElementById('q-resolution').value = q.preferred_resolution || '1080p';
+  syncCustomSelect(document.getElementById('q-resolution'));
   document.getElementById('q-fallback').checked = q.allow_fallback !== false;
   document.getElementById('q-exclude-remux').checked = !!q.exclude_remux;
   document.getElementById('q-exclude-cam').checked = !!q.exclude_cam;
@@ -1563,6 +1718,7 @@ if (location.hash) {
   else if (VIEWS.indexOf(h) >= 0) initial = h;
   else if (SETTINGS_TABS.indexOf(h) >= 0) { initial = 'settings'; currentSettingsTab = h; }
 }
+enhanceSelects(document);
 switchView(initial);
 switchSubGroup(subGroup, false);
 loadSettings();

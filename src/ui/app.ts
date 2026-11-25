@@ -228,8 +228,8 @@ export function appHtml(initialView: string): string {
               <div class="field">
                 <label class="field-label" for="f-mode">执行模式</label>
                 <select name="mode" id="f-mode">
+                  <option value="auto" selected>自动转存</option>
                   <option value="manual">手动确认</option>
-                  <option value="auto">自动转存</option>
                 </select>
               </div>
               <div class="field">
@@ -617,6 +617,9 @@ export function appHtml(initialView: string): string {
 
 <!-- 全局 Toast 容器 -->
 <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+
+<!-- 共享自定义下拉浮层 -->
+<div class="pp-popover" id="pp-popover" role="listbox" hidden></div>
 
 <script>
 ${APP_SCRIPT}

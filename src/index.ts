@@ -1225,7 +1225,7 @@ async function handleCreateSub(req: Request, store: Store): Promise<Response> {
     poster_path: typeof input.poster_path === "string" && input.poster_path ? input.poster_path : undefined,
     overview: typeof input.overview === "string" && input.overview ? input.overview : undefined,
     rating: typeof input.rating === "number" && Number.isFinite(input.rating) ? input.rating : undefined,
-    mode: input.mode ?? "manual",
+    mode: input.mode ?? "auto",
     status: "pending_search",
     target_dir: input.target_dir, // TODO: derive from §3 directory rules when absent
     next_check_at: t, // due immediately; the Driver picks it up on its next round
