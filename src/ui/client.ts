@@ -512,7 +512,7 @@ function subCard(s) {
           + (r === '2160p' ? '优先 4K' : '优先 ' + r) + '</option>';
       }).join('')
     + '</select>';
-  var intervalEdit = '<select data-iedit="' + s.id + '" title="检查间隔：这条订阅隔多久检查一次新集。跟随全局 = 统一批次（北京时间 00/06/12/18，最小间隔 ' + globalCheckHours + ' 小时）；单独设置 = 处理后满 N 小时即到期，不对齐批次">'
+  var intervalEdit = '<select data-iedit="' + s.id + '" title="检查间隔：这条订阅隔多久检查一次新集。处理完成后满 N 小时即到期；跟随全局 = 用全局间隔 ' + globalCheckHours + ' 小时，单独设置 = 用这条自己的间隔">'
     + intervalOptionsHtml(s.check_interval_hours)
     + '</select>';
   var checkNowBtn = (done || s.status === 'paused')

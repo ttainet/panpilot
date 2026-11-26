@@ -166,7 +166,7 @@ Secret 中，不进 D1/代码/日志）。网页端永远看不到 Cookie（明�
 | status | TEXT NOT NULL | 状态机见 §5 |
 | target_dir | TEXT | 入库目标目录（按 §3 生成后落库，可人工改） |
 | next_check_at | INTEGER | 下次应被 Driver 查询的时间（调度到期判断） |
-| check_interval_hours | REAL | 每订阅单独检查间隔（小时，v1.3 新增）；NULL = 跟随全局批次制 |
+| check_interval_hours | REAL | 每订阅单独检查间隔（小时，v1.3 新增）；NULL = 跟随全局间隔 |
 | last_checked_at | INTEGER | 上次 Driver 实际查询时间 |
 | last_error | TEXT | 最近一次失败原因，可空 |
 | created_at / updated_at | INTEGER NOT NULL | |
@@ -434,6 +434,10 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
    从 Driver 页签移入），
    优先于 Worker 环境变量 `CHECK_INTERVAL_HOURS`（退为默认值）；
    只影响之后的新排期，已排定的 `next_check_at` 不动。
+   **v1.5 废除批次对齐**（用户拍板）：v1.2 的批次制让间隔名不副实
+   （设 2h 实际等 6h+），且 Driver 唤醒已足够频繁、批次失去意义。
+   全部订阅统一为精确间隔：`next_check_at` = 处理时刻 + 生效间隔
+   （单独间隔优先，否则全局），服务端 helper 收敛为 `nextCheckAtFor()`。
 3. ~~TMDB API Key 提供方式~~ **已定**：参考 MoviePilot 机制 —— TMDB API Key 在
    **PanPilot 设置页配置并保存**（存 settings 表，页面只显示末 4 位掩码，可更新/清除）；
    订阅流程为先 TMDB 搜索选剧、点选后回填元数据，**订阅绑定 TMDB ID 而非只存名字，后续按季订阅**；

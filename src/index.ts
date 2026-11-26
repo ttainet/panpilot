@@ -123,6 +123,13 @@
  * minimum. New subscriptions are still due immediately and only join
  * the batch rhythm after their first processing; finished
  * (ended/completed) subscriptions are untouched.
+ *
+ * v1.5: batch alignment removed (user decision, 2026-11-26: the rhythm
+ * made the configured interval misleading — a 2h interval could mean a
+ * 6h+ wait for the next batch point). Scheduling is exact again, for
+ * everyone: next_check_at = processed time + effective interval (the
+ * subscription's own check_interval_hours when set, else the global
+ * one). New subscriptions are still due immediately.
  */
 
 import {
@@ -194,7 +201,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "1.4.2";
+const VERSION = "1.5.0";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -225,10 +232,8 @@ export interface Subscription {
    *  quality profile. Distinct from the legacy free-form quality_pref. */
   quality?: string | null;
   /** v1.3: per-subscription check interval in hours; absent/null = follow
-   *  the global unified batch schedule (CHECK_INTERVAL_HOURS minimum +
-   *  Beijing 00/06/12/18 batch points). When set, the next check is
-   *  scheduled exactly this many hours after the last processing,
-   *  without batch alignment. */
+   *  the global interval. Either way the next check is scheduled exactly
+   *  that many hours after the last processing (v1.5: no alignment). */
   check_interval_hours?: number | null;
   /** Raw TMDB poster path (e.g. /abc.jpg); UI prefixes the image CDN host. */
   poster_path?: string;
@@ -365,7 +370,7 @@ async function effectiveCheckIntervalSeconds(store: Store, env: Env): Promise<nu
 
 /**
  * v1.3: validate a per-subscription check interval (hours). null / "" /
- * absent clears the override back to "follow the global batch schedule";
+ * absent clears the override back to "follow the global interval";
  * a number must lie within [0.5, 168]. Anything else is a 400.
  */
 function normalizeCheckInterval(v: unknown): { value: number | null; error?: string } {
@@ -378,39 +383,15 @@ function normalizeCheckInterval(v: unknown): { value: number | null; error?: str
 }
 
 /**
- * v1.3: the next check time for a subscription after it was processed.
- * A per-subscription interval schedules exactly that many hours from
- * now (no batch alignment); otherwise the unified batch rhythm (v1.2)
- * applies.
+ * The next check time for a subscription after it was processed:
+ * processed time + the effective interval — the subscription's own
+ * check_interval_hours when set (v1.3), otherwise the global interval.
+ * Exact for everyone since v1.5 removed the v1.2 batch alignment.
  */
 function nextCheckAtFor(sub: Subscription | null, globalIntervalSec: number): number {
   const own = sub?.check_interval_hours;
   if (own != null && own > 0) return now() + Math.round(own * 3600);
-  return nextBatchCheckAt(now(), globalIntervalSec);
-}
-
-/**
- * v1.2 unified batch scheduling: batch points are 00:00 / 06:00 / 12:00 /
- * 18:00 Beijing time. Computed with a fixed UTC+8 offset — Workers code
- * must never rely on the runtime's local timezone. Returns the first
- * batch point that is not earlier than (fromSec + minIntervalSec), so
- * with the default 6h minimum the effective interval lands in [6h, 12h].
- */
-const BATCH_OFFSET_SEC = 8 * 3600; // Beijing = UTC+8, fixed offset
-const BATCH_STEP_SEC = 6 * 3600; // four batch points per day
-
-function nextBatchCheckAt(fromSec: number, minIntervalSec: number): number {
-  const target = fromSec + Math.max(0, minIntervalSec);
-  // Shift into "Beijing wall-clock" epoch space, where batch points are
-  // the day start plus k * BATCH_STEP_SEC (k = 0..3, plus next-day 00:00).
-  const local = target + BATCH_OFFSET_SEC;
-  const dayStart = Math.floor(local / 86400) * 86400;
-  for (let k = 0; k <= 4; k++) {
-    const pointLocal = dayStart + k * BATCH_STEP_SEC;
-    if (pointLocal >= local) return pointLocal - BATCH_OFFSET_SEC;
-  }
-  // Unreachable: k = 4 is the next day's 00:00, always >= local.
-  return dayStart + 86400 - BATCH_OFFSET_SEC;
+  return now() + globalIntervalSec;
 }
 
 function json(data: unknown, status = 200): Response {
@@ -1392,7 +1373,7 @@ async function handlePatchSub(req: Request, store: Store, env: Env, id: string):
       if (cur && !FINISHED_STATUSES.includes(cur.status) && cur.status !== "paused") {
         clean.next_check_at = ci.value != null
           ? now() + Math.round(ci.value * 3600)
-          : nextBatchCheckAt(now(), await effectiveCheckIntervalSeconds(store, env));
+          : now() + (await effectiveCheckIntervalSeconds(store, env));
       }
     }
   }

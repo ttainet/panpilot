@@ -636,10 +636,10 @@ export function appHtml(initialView: string): string {
             <div class="card-head">
               <h2>订阅调度参数</h2>
             </div>
-            <p class="section-desc">Driver 按统一批次处理到期订阅：每天北京时间 <strong>00:00 / 06:00 / 12:00 / 18:00</strong> 四个批次。订阅处理完成后，下次检查对齐到不早于处理时刻 +<strong id="interval">…</strong> 小时的第一个批次点（实际间隔为最小间隔的 1–2 倍）。新建订阅立即可执行，首次处理后进入批次节奏。</p>
+            <p class="section-desc">订阅处理完成后，下次检查 = <strong>处理时刻 + 生效间隔</strong>（单条订阅单独设置的间隔优先，否则用下面的全局间隔 <strong id="interval">…</strong> 小时）。新建订阅立即可执行，首次处理后按此节奏排期；Driver 唤醒时处理所有已到期的订阅。</p>
             <div style="display:flex;gap:.5rem;align-items:flex-end;flex-wrap:wrap">
               <div class="field" style="min-width:180px">
-                <label class="field-label" for="set-interval">全局最小检查间隔</label>
+                <label class="field-label" for="set-interval">全局检查间隔</label>
                 <select id="set-interval">
                   <option value="1">1 小时</option>
                   <option value="2">2 小时</option>
