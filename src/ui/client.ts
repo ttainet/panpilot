@@ -517,7 +517,7 @@ function subCard(s) {
     + '</select>';
   var checkNowBtn = (done || s.status === 'paused')
     ? ''
-    : '<button type="button" class="btn btn-sm" data-act="checknow" data-id="' + s.id + '" title="把下次检查时间重置为现在：Driver 下次唤醒（每 2 小时）时一定会刷新这条订阅">' + ICONS.refresh + '<span>立即刷新</span></button>';
+    : '<button type="button" class="btn btn-sm" data-act="checknow" data-id="' + s.id + '" title="把下次检查时间重置为现在：Driver 下次唤醒时一定会刷新这条订阅">' + ICONS.refresh + '<span>立即刷新</span></button>';
   var nowSec = Math.floor(Date.now() / 1000);
   var timeLine = done
     ? '完成于 ' + fmtTime(s.updated_at)
