@@ -72,7 +72,7 @@ PanPilot 是一个影视订阅**控制面**（Cloudflare Workers + D1）。用�
 
 订阅对象关键字段：`id, title, original_title, year, tmdb_id, media_type
 (tv|movie|variety), region, season, total_episodes, quality_pref, mode
-(manual|auto), status, target_dir, next_check_at`。另外 pending 的每条
+(manual|auto), status, target_dir, next_check_at, check_interval_hours`。另外 pending 的每条
 订阅还附带两个画质字段（v1.0）：`quality` 是该订阅的清晰度覆盖
 （`2160p|1080p|720p`，为 null 表示跟随全局），`quality_profile` 是
 **已合并好的生效画质档案**（全局档案 + 该订阅覆盖），步骤 7 选源时
@@ -101,13 +101,20 @@ PanPilot 是一个影视订阅**控制面**（Cloudflare Workers + D1）。用�
   工作，不要因此中断整轮。
 - Cookie 只许放在内存里用；不要落盘明文缓存。非要缓存，用你运行环境的
   密钥存储并限制权限。
-- **调度是统一批次制**（v1.2）：所有订阅的 `next_check_at` 都对齐到
-  北京时间每天 **00:00 / 06:00 / 12:00 / 18:00** 四个批次点。一条订阅
-  处理完成后，服务端把它的下次检查排到「不早于处理时刻 +
+- **调度是统一批次制**（v1.2）：默认情况下所有订阅的 `next_check_at`
+  都对齐到北京时间每天 **00:00 / 06:00 / 12:00 / 18:00** 四个批次点。
+  一条订阅处理完成后，服务端把它的下次检查排到「不早于处理时刻 +
   `check_interval_hours`（默认 6）的第一个批次点」，实际间隔落在
   6–12 小时。`check_interval_hours` 字段保留，语义就是这个最小间隔。
   你只需要在批次点（或任意时刻）调 pending，返回的到期订阅即是整批
   待处理集合；新建订阅立即可执行，首次处理后才进入批次节奏。
+- **每订阅单独间隔**（v1.3）：订阅对象可能带 `check_interval_hours`
+  字段（用户在网页为单条订阅设置，null/缺失 = 跟随全局批次制）。
+  带单独间隔的订阅处理完成后，服务端把它的下次检查排到「处理时刻 +
+  该间隔小时」整点顺延，**不对齐批次点**。对你（Driver）没有行为
+  变化：仍只处理 pending 返回的到期订阅，不要自己算排期；用户也
+  可能随时在网页点「立即刷新」把某条订阅的 `next_check_at` 重置为
+  现在——它出现在 pending 里照常处理即可。
 
 ## 4. 标准一轮（十步）
 
@@ -293,9 +300,10 @@ pending 给的 `missing_episodes`——用户可能在夸克 App 里手动增删
    `{season, episode, status: "stored", source_share_code, source_channel,
    quark_fid, file_name, file_size}`。
 4. 订阅状态：仍有缺集 → `subscription_status: "partial_stored"`（服务端会
-   自动排下一轮 `next_check_at`：统一批次制，对齐到不早于处理时刻 +
+   自动排下一轮 `next_check_at`：默认统一批次制，对齐到不早于处理时刻 +
    `check_interval_hours` 的第一个批次点，批次点为北京时间每天
-   00:00 / 06:00 / 12:00 / 18:00，见 §3）；全部集齐 →
+   00:00 / 06:00 / 12:00 / 18:00；该订阅带单独 `check_interval_hours`
+   时改为处理时刻 + 该间隔顺延、不对齐批次，见 §3）；全部集齐 →
    `"completed"`；**回写前再用 TMDB Key 查一次该剧的 TMDB 状态**，
    若已 **Ended/Canceled 且本季集数已齐全**，用 `"ended"` 代替
    `"completed"`，让订阅进入终态关闭、不再被下一轮重复拉起。

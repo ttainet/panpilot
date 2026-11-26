@@ -910,7 +910,7 @@ export const APP_CSS = `
   .sub-footer {
     display: flex;
     align-items: center;
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
     gap: 0.42rem;
     padding: 0.56rem 1rem;
     border-top: 1px solid var(--pp-border);

@@ -194,7 +194,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -224,6 +224,12 @@ export interface Subscription {
    *  ("2160p" | "1080p" | "720p"); absent/null = follow the global
    *  quality profile. Distinct from the legacy free-form quality_pref. */
   quality?: string | null;
+  /** v1.3: per-subscription check interval in hours; absent/null = follow
+   *  the global unified batch schedule (CHECK_INTERVAL_HOURS minimum +
+   *  Beijing 00/06/12/18 batch points). When set, the next check is
+   *  scheduled exactly this many hours after the last processing,
+   *  without batch alignment. */
+  check_interval_hours?: number | null;
   /** Raw TMDB poster path (e.g. /abc.jpg); UI prefixes the image CDN host. */
   poster_path?: string;
   overview?: string;
@@ -338,6 +344,32 @@ const uid = () => crypto.randomUUID();
 function checkIntervalSeconds(env: Env): number {
   const h = Number(env.CHECK_INTERVAL_HOURS ?? "6");
   return (Number.isFinite(h) && h > 0 ? h : 6) * 3600;
+}
+
+/**
+ * v1.3: validate a per-subscription check interval (hours). null / "" /
+ * absent clears the override back to "follow the global batch schedule";
+ * a number must lie within [0.5, 168]. Anything else is a 400.
+ */
+function normalizeCheckInterval(v: unknown): { value: number | null; error?: string } {
+  if (v === null || v === undefined || v === "") return { value: null };
+  const n = typeof v === "number" ? v : Number(v);
+  if (!Number.isFinite(n) || n < 0.5 || n > 168) {
+    return { value: null, error: "check_interval_hours must be a number of hours between 0.5 and 168" };
+  }
+  return { value: n };
+}
+
+/**
+ * v1.3: the next check time for a subscription after it was processed.
+ * A per-subscription interval schedules exactly that many hours from
+ * now (no batch alignment); otherwise the unified batch rhythm (v1.2)
+ * applies.
+ */
+function nextCheckAtFor(sub: Subscription | null, env: Env): number {
+  const own = sub?.check_interval_hours;
+  if (own != null && own > 0) return now() + Math.round(own * 3600);
+  return nextBatchCheckAt(now(), checkIntervalSeconds(env));
 }
 
 /**
@@ -909,6 +941,7 @@ function rowToSub(r: Row): Subscription {
   if (r.next_check_at != null) sub.next_check_at = Number(r.next_check_at);
   if (r.last_checked_at != null) sub.last_checked_at = Number(r.last_checked_at);
   if (r.last_error != null) sub.last_error = String(r.last_error);
+  if (r.check_interval_hours != null) sub.check_interval_hours = Number(r.check_interval_hours);
   return sub;
 }
 
@@ -944,7 +977,7 @@ const SUB_COLUMNS = [
   "id", "title", "original_title", "year", "tmdb_id", "media_type", "region",
   "season", "total_episodes", "quality_pref", "quality", "poster_path", "overview", "rating",
   "mode", "status", "target_dir",
-  "next_check_at", "last_checked_at", "last_error", "created_at", "updated_at",
+  "next_check_at", "last_checked_at", "last_error", "check_interval_hours", "created_at", "updated_at",
 ] as const;
 
 function subValues(s: Subscription): unknown[] {
@@ -953,7 +986,7 @@ function subValues(s: Subscription): unknown[] {
     s.media_type, s.region ?? null, s.season ?? null, s.total_episodes ?? null,
     s.quality_pref ?? null, s.quality ?? null, s.poster_path ?? null, s.overview ?? null, s.rating ?? null,
     s.mode, s.status, s.target_dir ?? null,
-    s.next_check_at ?? null, s.last_checked_at ?? null, s.last_error ?? null,
+    s.next_check_at ?? null, s.last_checked_at ?? null, s.last_error ?? null, s.check_interval_hours ?? null,
     s.created_at, s.updated_at,
   ];
 }
@@ -1258,8 +1291,13 @@ function getStore(env: Env): Store {
 // Subscription handlers (web API)
 // ---------------------------------------------------------------------------
 
-async function handleListSubs(store: Store): Promise<Response> {
-  return json({ subscriptions: await store.listSubscriptions() });
+async function handleListSubs(store: Store, env: Env): Promise<Response> {
+  // v1.3: also return the global check interval (hours) so the UI can
+  // label subscriptions that follow the global batch schedule.
+  return json({
+    subscriptions: await store.listSubscriptions(),
+    check_interval_hours: checkIntervalSeconds(env) / 3600,
+  });
 }
 
 async function handleCreateSub(req: Request, store: Store): Promise<Response> {
@@ -1269,6 +1307,10 @@ async function handleCreateSub(req: Request, store: Store): Promise<Response> {
   // absent/empty means "follow the global quality profile".
   const q = normalizeQualityOverride(input.quality);
   if (q.error) return err("bad_request", q.error, 400);
+  // v1.3: optional per-subscription check interval (hours);
+  // absent/empty means "follow the global batch schedule".
+  const ci = normalizeCheckInterval(input.check_interval_hours);
+  if (ci.error) return err("bad_request", ci.error, 400);
   const t = now();
   const sub: Subscription = {
     id: uid(),
@@ -1282,6 +1324,7 @@ async function handleCreateSub(req: Request, store: Store): Promise<Response> {
     total_episodes: input.total_episodes,
     quality_pref: input.quality_pref,
     quality: q.value,
+    check_interval_hours: ci.value,
     poster_path: typeof input.poster_path === "string" && input.poster_path ? input.poster_path : undefined,
     overview: typeof input.overview === "string" && input.overview ? input.overview : undefined,
     rating: typeof input.rating === "number" && Number.isFinite(input.rating) ? input.rating : undefined,
@@ -1303,7 +1346,7 @@ async function handleGetSub(store: Store, id: string): Promise<Response> {
   return json({ subscription: sub, episodes });
 }
 
-async function handlePatchSub(req: Request, store: Store, id: string): Promise<Response> {
+async function handlePatchSub(req: Request, store: Store, env: Env, id: string): Promise<Response> {
   const patch = await body<Partial<Subscription>>(req);
   if (!patch) return err("bad_request", "invalid JSON body", 400);
   // Whitelist mutable fields so clients cannot rewrite ids/timestamps.
@@ -1315,6 +1358,25 @@ async function handlePatchSub(req: Request, store: Store, id: string): Promise<R
     const q = normalizeQualityOverride(patch.quality);
     if (q.error) return err("bad_request", q.error, 400);
     clean.quality = q.value;
+  }
+  // v1.3: per-subscription check interval — a number of hours sets it,
+  // null/"" clears it back to "follow the global batch schedule";
+  // anything outside [0.5, 168] is a 400. Changing it takes effect
+  // immediately: the next check is rescheduled from now (unless the
+  // caller also pinned next_check_at explicitly, and unless the
+  // subscription is finished or paused — those are not scheduled).
+  if (patch.check_interval_hours !== undefined) {
+    const ci = normalizeCheckInterval(patch.check_interval_hours);
+    if (ci.error) return err("bad_request", ci.error, 400);
+    clean.check_interval_hours = ci.value;
+    if (patch.next_check_at === undefined) {
+      const cur = await store.getSubscription(id);
+      if (cur && !FINISHED_STATUSES.includes(cur.status) && cur.status !== "paused") {
+        clean.next_check_at = ci.value != null
+          ? now() + Math.round(ci.value * 3600)
+          : nextBatchCheckAt(now(), checkIntervalSeconds(env));
+      }
+    }
   }
   for (const k of Object.keys(clean) as (keyof typeof clean)[]) if (clean[k] === undefined) delete clean[k];
   const sub = await store.updateSubscription(id, clean);
@@ -1466,10 +1528,13 @@ async function handleDriverProgress(req: Request, store: Store, env: Env, ctx?: 
   if (input.next_check_at) {
     patch.next_check_at = input.next_check_at;
   } else if (input.subscription_status === "partial_stored") {
-    // Still following this show: schedule the next check on the unified
-    // batch rhythm (v1.2) — the first Beijing 00/06/12/18 batch point
-    // that is at least the check interval (default 6h) from now.
-    patch.next_check_at = nextBatchCheckAt(now(), checkIntervalSeconds(env));
+    // Still following this show: schedule the next check. A
+    // per-subscription interval (v1.3) schedules exactly that many
+    // hours from now; otherwise the unified batch rhythm (v1.2)
+    // applies — the first Beijing 00/06/12/18 batch point that is at
+    // least the global check interval (default 6h) from now.
+    const cur = await store.getSubscription(task.subscription_id);
+    patch.next_check_at = nextCheckAtFor(cur, env);
   }
   if (input.note) patch.last_error = input.note;
   if (Object.keys(patch).length) await store.updateSubscription(task.subscription_id, patch);
@@ -3335,13 +3400,13 @@ export default {
       }
 
       if (pathname === "/api/subscriptions" || pathname.startsWith("/api/subscriptions/")) {
-        if (pathname === "/api/subscriptions" && req.method === "GET") return handleListSubs(store);
+        if (pathname === "/api/subscriptions" && req.method === "GET") return handleListSubs(store, env);
         if (pathname === "/api/subscriptions" && req.method === "POST") return handleCreateSub(req, store);
         const m = pathname.match(/^\/api\/subscriptions\/([^/]+)$/);
         if (m) {
           const id = decodeURIComponent(m[1]);
           if (req.method === "GET") return handleGetSub(store, id);
-          if (req.method === "PATCH") return handlePatchSub(req, store, id);
+          if (req.method === "PATCH") return handlePatchSub(req, store, env, id);
           if (req.method === "DELETE") return handleDeleteSub(store, id);
         }
         return err("not_found", "unknown subscriptions endpoint", 404);

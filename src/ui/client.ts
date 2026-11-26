@@ -9,6 +9,7 @@ import {
   ICON_MOON,
   ICON_PAUSE,
   ICON_PLAY,
+  ICON_REFRESH,
   ICON_SUN,
   ICON_TRASH,
 } from "./icons";
@@ -22,6 +23,7 @@ const ICON_JSON = JSON.stringify({
   moon: ICON_MOON,
   pause: ICON_PAUSE,
   play: ICON_PLAY,
+  refresh: ICON_REFRESH,
   trash: ICON_TRASH,
   info: ICON_INFO,
   check: ICON_CHECK,
@@ -50,6 +52,7 @@ var EP_STATUS_LABEL = {
 };
 
 var subsCache = [];
+var globalCheckHours = 6;
 var storedMap = {};
 var settingsCache = null;
 
@@ -181,7 +184,7 @@ function enhanceSelects(root) {
     (function (sel) {
       if (sel._csWrap) { syncCustomSelect(sel); return; }
       var wrap = document.createElement('div');
-      wrap.className = 'cs-wrap' + (sel.hasAttribute('data-qedit') ? ' is-sm' : '');
+      wrap.className = 'cs-wrap' + ((sel.hasAttribute('data-qedit') || sel.hasAttribute('data-iedit')) ? ' is-sm' : '');
       sel.parentNode.insertBefore(wrap, sel);
       wrap.appendChild(sel);
       sel.classList.add('cs-native');
@@ -472,6 +475,24 @@ function progressOf(s) {
   return { stored: stored, total: total, pct: pct, text: text };
 }
 
+var INTERVAL_PRESETS = [1, 2, 3, 6, 12, 24];
+function intervalOptionsHtml(current) {
+  var opts = INTERVAL_PRESETS.slice();
+  if (current && opts.indexOf(current) < 0) {
+    opts.push(current);
+    opts.sort(function (a, b) { return a - b; });
+  }
+  return '<option value=""' + (!current ? ' selected' : '') + '>跟随全局</option>'
+    + opts.map(function (h) {
+        return '<option value="' + h + '"' + (current === h ? ' selected' : '') + '>每 ' + h + ' 小时</option>';
+      }).join('');
+}
+function intervalShort(s) {
+  return s.check_interval_hours
+    ? '每 ' + s.check_interval_hours + ' 小时 · 单独设置'
+    : '每 ' + globalCheckHours + ' 小时 · 跟随全局';
+}
+
 function subCard(s) {
   var p = progressOf(s);
   var done = isFinishedSub(s);
@@ -491,9 +512,19 @@ function subCard(s) {
           + (r === '2160p' ? '优先 4K' : '优先 ' + r) + '</option>';
       }).join('')
     + '</select>';
+  var intervalEdit = '<select data-iedit="' + s.id + '" title="检查间隔：这条订阅隔多久检查一次新集。跟随全局 = 统一批次（北京时间 00/06/12/18，最小间隔 ' + globalCheckHours + ' 小时）；单独设置 = 处理后满 N 小时即到期，不对齐批次">'
+    + intervalOptionsHtml(s.check_interval_hours)
+    + '</select>';
+  var checkNowBtn = (done || s.status === 'paused')
+    ? ''
+    : '<button type="button" class="btn btn-sm" data-act="checknow" data-id="' + s.id + '" title="把下次检查时间重置为现在：Driver 下次唤醒（每 2 小时）时一定会刷新这条订阅">' + ICONS.refresh + '<span>立即刷新</span></button>';
+  var nowSec = Math.floor(Date.now() / 1000);
   var timeLine = done
     ? '完成于 ' + fmtTime(s.updated_at)
-    : '下次检查：' + fmtTime(s.next_check_at);
+    : ((s.next_check_at && s.next_check_at <= nowSec)
+        ? '已到期 · 等待 Driver 刷新'
+        : '下次检查：' + fmtTime(s.next_check_at))
+      + ' · ' + intervalShort(s);
   var errLine = s.status === 'error' && s.last_error
     ? '<div class="sub-err-note" title="' + esc(s.last_error) + '">' + esc(s.last_error) + '</div>'
     : '';
@@ -518,7 +549,9 @@ function subCard(s) {
     + '<div class="sub-footer">'
     + pauseBtn
     + qualityEdit
+    + intervalEdit
     + '<span class="spacer"></span>'
+    + checkNowBtn
     + '<button type="button" class="btn btn-ghost btn-sm" data-detail="' + s.id + '" title="查看详情与集进度">' + ICONS.info + '<span>详情</span></button>'
     + '<button type="button" class="btn btn-icon sub-del-btn" data-act="delete" data-id="' + s.id + '" title="删除订阅" aria-label="删除订阅">' + ICONS.trash + '</button>'
     + '</div></article>';
@@ -668,6 +701,9 @@ async function loadSubs() {
   var r = await api('/api/subscriptions');
   var data = await r.json();
   subsCache = data.subscriptions || [];
+  if (typeof data.check_interval_hours === 'number' && data.check_interval_hours > 0) {
+    globalCheckHours = data.check_interval_hours;
+  }
   var rs = await api('/api/stats');
   var sd = await rs.json();
   storedMap = (sd.stats && sd.stats.stored_by_subscription) || {};
@@ -748,6 +784,8 @@ async function openSubDetail(id) {
       + '<option value="2160p"' + (s.quality === '2160p' ? ' selected' : '') + '>优先 4K</option>'
       + '<option value="1080p"' + (s.quality === '1080p' ? ' selected' : '') + '>优先 1080p</option>'
       + '<option value="720p"' + (s.quality === '720p' ? ' selected' : '') + '>优先 720p</option></select></div>'
+      + '<div class="field"><label class="field-label" for="sd-interval">检查间隔</label>'
+      + '<select id="sd-interval">' + intervalOptionsHtml(s.check_interval_hours) + '</select></div>'
       + '</div></div></div>'
       + (s.overview ? '<div class="modal-section"><div class="modal-section-title">剧情简介</div><p class="overview">' + esc(s.overview) + '</p></div>' : '')
       + errBlock
@@ -772,10 +810,16 @@ async function openSubDetail(id) {
       try {
         var mode = document.getElementById('sd-mode').value;
         var quality = document.getElementById('sd-quality').value;
+        var payload = { mode: mode, quality: quality === '' ? null : quality };
+        var intervalEl = document.getElementById('sd-interval');
+        if (intervalEl) {
+          var newInterval = intervalEl.value === '' ? null : Number(intervalEl.value);
+          if (newInterval !== (s.check_interval_hours || null)) payload.check_interval_hours = newInterval;
+        }
         var pr = await api('/api/subscriptions/' + encodeURIComponent(s.id), {
           method: 'PATCH',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ mode: mode, quality: quality === '' ? null : quality })
+          body: JSON.stringify(payload)
         });
         if (!pr.ok) { toast('保存更改失败', 'error'); return; }
         toast('已保存订阅配置', 'success');
@@ -840,6 +884,18 @@ document.getElementById('sub-grid').addEventListener('click', async function (e)
     } finally {
       setBtnLoading(btn, false);
     }
+  } else if (act === 'checknow') {
+    setBtnLoading(btn, true);
+    try {
+      var cr = await api('/api/subscriptions/' + id, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ next_check_at: Math.floor(Date.now() / 1000) })
+      });
+      if (!cr.ok) { toast('重置失败', 'error'); return; }
+      toast('已重置为立即到期，Driver 下次唤醒时将刷新这条订阅', 'success');
+    } finally {
+      setBtnLoading(btn, false);
+    }
   }
   loadSubs();
 });
@@ -856,6 +912,25 @@ document.getElementById('sub-grid').addEventListener('change', async function (e
     });
     if (!r.ok) { toast('画质偏好保存失败', 'error'); }
     else { toast('已更新画质偏好', 'success'); }
+  } finally {
+    sel.disabled = false;
+    syncCustomSelect(sel);
+  }
+  loadSubs();
+});
+
+document.getElementById('sub-grid').addEventListener('change', async function (e) {
+  var sel = e.target.closest('select[data-iedit]');
+  if (!sel) return;
+  sel.disabled = true;
+  syncCustomSelect(sel);
+  try {
+    var r = await api('/api/subscriptions/' + sel.getAttribute('data-iedit'), {
+      method: 'PATCH', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ check_interval_hours: sel.value === '' ? null : Number(sel.value) })
+    });
+    if (!r.ok) { toast('检查间隔保存失败', 'error'); }
+    else { toast('已更新检查间隔，下次检查已按新间隔重新排期', 'success'); }
   } finally {
     sel.disabled = false;
     syncCustomSelect(sel);
@@ -1070,10 +1145,12 @@ async function openDetail(item, overrideMediaType, extra) {
   var qualityField = '<div class="field"><label class="field-label" for="m-quality">画质覆盖</label>'
     + '<select id="m-quality"><option value="">跟随全局</option><option value="2160p">优先 4K</option>'
     + '<option value="1080p">优先 1080p</option><option value="720p">优先 720p</option></select></div>';
+  var intervalField = '<div class="field"><label class="field-label" for="m-interval">检查间隔</label>'
+    + '<select id="m-interval">' + intervalOptionsHtml(null) + '</select></div>';
   var controls = (d.media_type === 'tv' || d.media_type === 'variety') && seasonOptions
     ? '<div class="form-grid-3" style="margin-top:.85rem"><div class="field"><label class="field-label" for="m-season">订阅季</label>'
-      + '<select id="m-season">' + seasonOptions + '</select></div>' + modeField + qualityField + '</div>'
-    : '<div class="form-grid-2" style="margin-top:.85rem">' + modeField + qualityField + '</div>';
+      + '<select id="m-season">' + seasonOptions + '</select></div>' + modeField + qualityField + intervalField + '</div>'
+    : '<div class="form-grid-2" style="margin-top:.85rem">' + modeField + qualityField + intervalField + '</div>';
 
   var banner = d.backdrop_path
     ? '<div class="modal-banner" style="background-image:url(\'' + esc(backdropUrl(d.backdrop_path)) + '\')"></div>'
@@ -1165,6 +1242,7 @@ async function subscribeFromModal() {
       year: d.year, tmdb_id: d.tmdb_id, media_type: d.media_type,
       region: d.region || undefined, mode: document.getElementById('m-mode').value,
       quality: document.getElementById('m-quality').value || undefined,
+      check_interval_hours: (function () { var el = document.getElementById('m-interval'); return el && el.value !== '' ? Number(el.value) : undefined; })(),
       poster_path: d.poster_path || undefined, overview: d.overview || undefined,
       rating: typeof d.rating === 'number' ? d.rating : undefined
     };
