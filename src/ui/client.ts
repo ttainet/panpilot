@@ -482,7 +482,7 @@ function intervalOptionsHtml(current) {
     opts.push(current);
     opts.sort(function (a, b) { return a - b; });
   }
-  return '<option value=""' + (!current ? ' selected' : '') + '>跟随全局</option>'
+  return '<option value=""' + (!current ? ' selected' : '') + '>间隔 · 跟随全局</option>'
     + opts.map(function (h) {
         return '<option value="' + h + '"' + (current === h ? ' selected' : '') + '>每 ' + h + ' 小时</option>';
       }).join('');
@@ -506,7 +506,7 @@ function subCard(s) {
     ? '<button type="button" class="btn btn-sm" data-act="resume" data-id="' + s.id + '">' + ICONS.play + '<span>恢复</span></button>'
     : '<button type="button" class="btn btn-sm" data-act="pause" data-id="' + s.id + '">' + ICONS.pause + '<span>暂停</span></button>';
   var qualityEdit = '<select data-qedit="' + s.id + '" title="画质偏好：只覆盖首选清晰度，其余跟随全局档案">'
-    + '<option value=""' + (!s.quality ? ' selected' : '') + '>跟随全局</option>'
+    + '<option value=""' + (!s.quality ? ' selected' : '') + '>画质 · 跟随全局</option>'
     + ['2160p', '1080p', '720p'].map(function (r) {
         return '<option value="' + r + '"' + (s.quality === r ? ' selected' : '') + '>'
           + (r === '2160p' ? '优先 4K' : '优先 ' + r) + '</option>';
@@ -780,7 +780,7 @@ async function openSubDetail(id) {
       + '<select id="sd-mode"><option value="auto"' + (s.mode === 'auto' ? ' selected' : '') + '>自动转存</option>'
       + '<option value="manual"' + (s.mode === 'manual' ? ' selected' : '') + '>手动确认</option></select></div>'
       + '<div class="field"><label class="field-label" for="sd-quality">画质覆盖</label>'
-      + '<select id="sd-quality"><option value=""' + (!s.quality ? ' selected' : '') + '>跟随全局</option>'
+      + '<select id="sd-quality"><option value=""' + (!s.quality ? ' selected' : '') + '>画质 · 跟随全局</option>'
       + '<option value="2160p"' + (s.quality === '2160p' ? ' selected' : '') + '>优先 4K</option>'
       + '<option value="1080p"' + (s.quality === '1080p' ? ' selected' : '') + '>优先 1080p</option>'
       + '<option value="720p"' + (s.quality === '720p' ? ' selected' : '') + '>优先 720p</option></select></div>'
@@ -1143,7 +1143,7 @@ async function openDetail(item, overrideMediaType, extra) {
   var modeField = '<div class="field"><label class="field-label" for="m-mode">执行模式</label>'
     + '<select id="m-mode"><option value="auto" selected>自动转存</option><option value="manual">手动确认</option></select></div>';
   var qualityField = '<div class="field"><label class="field-label" for="m-quality">画质覆盖</label>'
-    + '<select id="m-quality"><option value="">跟随全局</option><option value="2160p">优先 4K</option>'
+    + '<select id="m-quality"><option value="">画质 · 跟随全局</option><option value="2160p">优先 4K</option>'
     + '<option value="1080p">优先 1080p</option><option value="720p">优先 720p</option></select></div>';
   var intervalField = '<div class="field"><label class="field-label" for="m-interval">检查间隔</label>'
     + '<select id="m-interval">' + intervalOptionsHtml(null) + '</select></div>';
