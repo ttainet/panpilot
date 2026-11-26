@@ -359,7 +359,7 @@ document.addEventListener('keydown', function (e) {
 });
 
 /* ---------- Settings Tabs (v0.8 — keep DOM mounted) ---------- */
-var SETTINGS_TABS = ['account', 'tmdb', 'quark', 'channels', 'directories', 'quality', 'driver', 'wecom'];
+var SETTINGS_TABS = ['account', 'tmdb', 'quark', 'channels', 'directories', 'quality', 'subscription', 'driver', 'wecom'];
 var currentSettingsTab = 'account';
 function switchSettingsTab(name, updateHash) {
   if (SETTINGS_TABS.indexOf(name) < 0) name = 'account';

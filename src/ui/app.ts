@@ -369,6 +369,7 @@ export function appHtml(initialView: string): string {
           <button type="button" class="settings-tab" data-stab="channels" role="tab">搜索源</button>
           <button type="button" class="settings-tab" data-stab="directories" role="tab">入库目录</button>
           <button type="button" class="settings-tab" data-stab="quality" role="tab">画质偏好</button>
+          <button type="button" class="settings-tab" data-stab="subscription" role="tab">订阅设置</button>
           <button type="button" class="settings-tab" data-stab="driver" role="tab">Driver</button>
           <button type="button" class="settings-tab" data-stab="wecom" role="tab">企业微信</button>
         </div>
@@ -630,6 +631,32 @@ export function appHtml(initialView: string): string {
           </div>
         </div>
 
+        <div class="settings-panel" id="spanel-subscription">
+          <div class="card">
+            <div class="card-head">
+              <h2>订阅调度参数</h2>
+            </div>
+            <p class="section-desc">Driver 按统一批次处理到期订阅：每天北京时间 <strong>00:00 / 06:00 / 12:00 / 18:00</strong> 四个批次。订阅处理完成后，下次检查对齐到不早于处理时刻 +<strong id="interval">…</strong> 小时的第一个批次点（实际间隔为最小间隔的 1–2 倍）。新建订阅立即可执行，首次处理后进入批次节奏。</p>
+            <div style="display:flex;gap:.5rem;align-items:flex-end;flex-wrap:wrap">
+              <div class="field" style="min-width:180px">
+                <label class="field-label" for="set-interval">全局最小检查间隔</label>
+                <select id="set-interval">
+                  <option value="1">1 小时</option>
+                  <option value="2">2 小时</option>
+                  <option value="3">3 小时</option>
+                  <option value="6">6 小时</option>
+                  <option value="12">12 小时</option>
+                  <option value="24">24 小时</option>
+                </select>
+              </div>
+              <button type="button" class="btn btn-primary" id="set-interval-save">保存</button>
+              <button type="button" class="btn btn-ghost" id="set-interval-reset">恢复默认</button>
+              <span class="muted" id="set-interval-state" style="padding-bottom:.45rem"></span>
+            </div>
+            <p class="section-desc" style="margin-bottom:0;margin-top:.6rem">保存后即时生效于之后的新排期；已经排定的下次检查时间不变，下一次处理后按新间隔排。单条订阅在卡片上单独设置的间隔优先于全局。</p>
+          </div>
+        </div>
+
         <div class="settings-panel" id="spanel-driver">
           <div class="card" id="card-driver-keys">
             <div class="card-head">
@@ -686,29 +713,6 @@ export function appHtml(initialView: string): string {
             </div>
           </div>
 
-          <div class="card">
-            <div class="card-head">
-              <h2>Driver 调度参数</h2>
-            </div>
-            <p class="section-desc">Driver 按统一批次处理到期订阅：每天北京时间 <strong>00:00 / 06:00 / 12:00 / 18:00</strong> 四个批次。订阅处理完成后，下次检查对齐到不早于处理时刻 +<strong id="interval">…</strong> 小时的第一个批次点（实际间隔为最小间隔的 1–2 倍）。新建订阅立即可执行，首次处理后进入批次节奏。Driver API Key 与网页端登录会话完全隔离。</p>
-            <div style="display:flex;gap:.5rem;align-items:flex-end;flex-wrap:wrap">
-              <div class="field" style="min-width:180px">
-                <label class="field-label" for="set-interval">全局最小检查间隔</label>
-                <select id="set-interval">
-                  <option value="1">1 小时</option>
-                  <option value="2">2 小时</option>
-                  <option value="3">3 小时</option>
-                  <option value="6">6 小时</option>
-                  <option value="12">12 小时</option>
-                  <option value="24">24 小时</option>
-                </select>
-              </div>
-              <button type="button" class="btn btn-primary" id="set-interval-save">保存</button>
-              <button type="button" class="btn btn-ghost" id="set-interval-reset">恢复默认</button>
-              <span class="muted" id="set-interval-state" style="padding-bottom:.45rem"></span>
-            </div>
-            <p class="section-desc" style="margin-bottom:0;margin-top:.6rem">保存后即时生效于之后的新排期；已经排定的下次检查时间不变，下一次处理后按新间隔排。单条订阅在卡片上单独设置的间隔优先于全局。</p>
-          </div>
         </div>
 
         <div class="settings-panel" id="spanel-wecom">

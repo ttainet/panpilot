@@ -430,7 +430,8 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
    间隔」顺延、不对齐批次点，改间隔即时重排；卡片另有「立即刷新」
    按钮把 `next_check_at` 重置为现在，保证 Driver 下次唤醒必处理。
    **v1.4 全局最小间隔改为设置页可改**（用户拍板）：存 D1 settings
-   键 `check_interval_hours`，设置页「Driver 调度参数」卡片内编辑，
+   键 `check_interval_hours`，设置页「订阅设置」页签内编辑（v1.4.1 起
+   从 Driver 页签移入），
    优先于 Worker 环境变量 `CHECK_INTERVAL_HOURS`（退为默认值）；
    只影响之后的新排期，已排定的 `next_check_at` 不动。
 3. ~~TMDB API Key 提供方式~~ **已定**：参考 MoviePilot 机制 —— TMDB API Key 在
