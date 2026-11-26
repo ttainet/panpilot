@@ -429,6 +429,10 @@ Base：`https://<worker-domain>/api/driver/*`，鉴权见 §7。所有响应 JSO
    可选 1/2/3/6/12/24 小时；带单独间隔的订阅处理后按「处理时刻 +
    间隔」顺延、不对齐批次点，改间隔即时重排；卡片另有「立即刷新」
    按钮把 `next_check_at` 重置为现在，保证 Driver 下次唤醒必处理。
+   **v1.4 全局最小间隔改为设置页可改**（用户拍板）：存 D1 settings
+   键 `check_interval_hours`，设置页「Driver 调度参数」卡片内编辑，
+   优先于 Worker 环境变量 `CHECK_INTERVAL_HOURS`（退为默认值）；
+   只影响之后的新排期，已排定的 `next_check_at` 不动。
 3. ~~TMDB API Key 提供方式~~ **已定**：参考 MoviePilot 机制 —— TMDB API Key 在
    **PanPilot 设置页配置并保存**（存 settings 表，页面只显示末 4 位掩码，可更新/清除）；
    订阅流程为先 TMDB 搜索选剧、点选后回填元数据，**订阅绑定 TMDB ID 而非只存名字，后续按季订阅**；

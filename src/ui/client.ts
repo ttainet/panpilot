@@ -1377,6 +1377,22 @@ async function loadSettings() {
   });
 
   document.getElementById('interval').textContent = data.settings.check_interval_hours;
+  var isel = document.getElementById('set-interval');
+  if (isel) {
+    var hv = String(data.settings.check_interval_hours);
+    var hasOpt = false;
+    for (var oi = 0; oi < isel.options.length; oi++) if (isel.options[oi].value === hv) { hasOpt = true; break; }
+    if (!hasOpt) {
+      var extraOpt = document.createElement('option');
+      extraOpt.value = hv;
+      extraOpt.textContent = hv + ' 小时';
+      isel.appendChild(extraOpt);
+    }
+    isel.value = hv;
+    syncCustomSelect(isel);
+  }
+  var istate = document.getElementById('set-interval-state');
+  if (istate) istate.textContent = data.settings.check_interval_custom ? '当前：自定义值（覆盖默认）' : '当前：默认值';
   var acc = data.settings.account;
   var uname = acc ? acc.username : '';
   document.getElementById('account-username').textContent = acc ? acc.username : '（未配置）';
@@ -1393,6 +1409,42 @@ async function loadSettings() {
   renderDashAlerts();
   loadDriverKeys();
 }
+
+var intervalSaveBtn = document.getElementById('set-interval-save');
+if (intervalSaveBtn) intervalSaveBtn.addEventListener('click', async function () {
+  var sel = document.getElementById('set-interval');
+  var btn = this;
+  setBtnLoading(btn, true);
+  try {
+    var r = await api('/api/settings', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ check_interval_hours: Number(sel.value) })
+    });
+    if (!r.ok) { toast('保存全局间隔失败', 'error'); return; }
+    toast('全局检查间隔已更新', 'success');
+    loadSettings();
+    loadSubs();
+  } finally {
+    setBtnLoading(btn, false);
+  }
+});
+var intervalResetBtn = document.getElementById('set-interval-reset');
+if (intervalResetBtn) intervalResetBtn.addEventListener('click', async function () {
+  var btn = this;
+  setBtnLoading(btn, true);
+  try {
+    var r = await api('/api/settings', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reset_check_interval: true })
+    });
+    if (!r.ok) { toast('恢复默认失败', 'error'); return; }
+    toast('已恢复默认全局间隔', 'success');
+    loadSettings();
+    loadSubs();
+  } finally {
+    setBtnLoading(btn, false);
+  }
+});
 
 function renderCookieSettings(c) {
   var st = document.getElementById('cookie-status');

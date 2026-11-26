@@ -194,7 +194,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "1.3.1";
+const VERSION = "1.4.0";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -347,6 +347,23 @@ function checkIntervalSeconds(env: Env): number {
 }
 
 /**
+ * v1.4: the effective global check interval in seconds. A value saved
+ * from the settings page (D1 settings key `check_interval_hours`) wins;
+ * the CHECK_INTERVAL_HOURS Worker variable is only the fallback
+ * default. Malformed stored values fall through to the env default.
+ */
+async function effectiveCheckIntervalSeconds(store: Store, env: Env): Promise<number> {
+  const raw = await store.getSetting(SETTING_CHECK_INTERVAL_HOURS);
+  if (raw) {
+    try {
+      const h = Number(JSON.parse(raw));
+      if (Number.isFinite(h) && h >= 0.5 && h <= 168) return Math.round(h * 3600);
+    } catch { /* malformed override — fall through to env */ }
+  }
+  return checkIntervalSeconds(env);
+}
+
+/**
  * v1.3: validate a per-subscription check interval (hours). null / "" /
  * absent clears the override back to "follow the global batch schedule";
  * a number must lie within [0.5, 168]. Anything else is a 400.
@@ -366,10 +383,10 @@ function normalizeCheckInterval(v: unknown): { value: number | null; error?: str
  * now (no batch alignment); otherwise the unified batch rhythm (v1.2)
  * applies.
  */
-function nextCheckAtFor(sub: Subscription | null, env: Env): number {
+function nextCheckAtFor(sub: Subscription | null, globalIntervalSec: number): number {
   const own = sub?.check_interval_hours;
   if (own != null && own > 0) return now() + Math.round(own * 3600);
-  return nextBatchCheckAt(now(), checkIntervalSeconds(env));
+  return nextBatchCheckAt(now(), globalIntervalSec);
 }
 
 /**
@@ -457,6 +474,7 @@ async function signPayload(payloadB64: string, secret: string): Promise<string> 
 // Effective login credentials: settings override wins over secrets
 // ---------------------------------------------------------------------------
 
+const SETTING_CHECK_INTERVAL_HOURS = "check_interval_hours";
 const SETTING_AUTH_USERNAME = "auth_username";
 const SETTING_AUTH_PASSWORD = "auth_password";
 const PBKDF2_ITERATIONS = 100_000;
@@ -1296,7 +1314,7 @@ async function handleListSubs(store: Store, env: Env): Promise<Response> {
   // label subscriptions that follow the global batch schedule.
   return json({
     subscriptions: await store.listSubscriptions(),
-    check_interval_hours: checkIntervalSeconds(env) / 3600,
+    check_interval_hours: (await effectiveCheckIntervalSeconds(store, env)) / 3600,
   });
 }
 
@@ -1374,7 +1392,7 @@ async function handlePatchSub(req: Request, store: Store, env: Env, id: string):
       if (cur && !FINISHED_STATUSES.includes(cur.status) && cur.status !== "paused") {
         clean.next_check_at = ci.value != null
           ? now() + Math.round(ci.value * 3600)
-          : nextBatchCheckAt(now(), checkIntervalSeconds(env));
+          : nextBatchCheckAt(now(), await effectiveCheckIntervalSeconds(store, env));
       }
     }
   }
@@ -1534,7 +1552,7 @@ async function handleDriverProgress(req: Request, store: Store, env: Env, ctx?: 
     // applies — the first Beijing 00/06/12/18 batch point that is at
     // least the global check interval (default 6h) from now.
     const cur = await store.getSubscription(task.subscription_id);
-    patch.next_check_at = nextCheckAtFor(cur, env);
+    patch.next_check_at = nextCheckAtFor(cur, await effectiveCheckIntervalSeconds(store, env));
   }
   if (input.note) patch.last_error = input.note;
   if (Object.keys(patch).length) await store.updateSubscription(task.subscription_id, patch);
@@ -1829,7 +1847,8 @@ async function handleGetSettings(store: Store, env: Env): Promise<Response> {
   return json({
     settings: {
       tmdb_api_key: { configured: !!key, masked: key ? maskKey(key) : null },
-      check_interval_hours: checkIntervalSeconds(env) / 3600,
+      check_interval_hours: (await effectiveCheckIntervalSeconds(store, env)) / 3600,
+      check_interval_custom: (await store.getSetting(SETTING_CHECK_INTERVAL_HOURS)) != null,
       account: auth ? { username: auth.username, source: auth.source } : null,
       // Cookie: status metadata only — never the value (nor its ciphertext).
       quark_cookie: {
@@ -1936,6 +1955,8 @@ async function handleUpdateSettings(req: Request, store: Store, env: Env): Promi
     reset_directories?: boolean;
     quality?: unknown;
     reset_quality?: boolean;
+    check_interval_hours?: unknown;
+    reset_check_interval?: boolean;
     wecom?: unknown;
     clear_wecom_secrets?: boolean;
   }>(req);
@@ -2043,6 +2064,27 @@ async function handleUpdateSettings(req: Request, store: Store, env: Env): Promi
   }
   if (typeof input.tg_channels_priority_only === "boolean") {
     await store.setSetting(SETTING_TG_PRIORITY_ONLY, JSON.stringify(input.tg_channels_priority_only));
+    changed = true;
+  }
+
+  // --- Global check interval (v1.4): settings-page override of the
+  // CHECK_INTERVAL_HOURS default, validated like a per-subscription
+  // interval. Applies to future scheduling computations only; already
+  // scheduled next_check_at values are left untouched. ---
+  if (input.reset_check_interval) {
+    await store.deleteSetting(SETTING_CHECK_INTERVAL_HOURS);
+    await store.addLog({ level: "info", event: "check_interval_reset" });
+    changed = true;
+  } else if (input.check_interval_hours !== undefined) {
+    const ci = normalizeCheckInterval(input.check_interval_hours);
+    if (ci.error || ci.value == null) {
+      return err("bad_request", "check_interval_hours must be a number of hours between 0.5 and 168", 400);
+    }
+    await store.setSetting(SETTING_CHECK_INTERVAL_HOURS, JSON.stringify(ci.value));
+    await store.addLog({
+      level: "info", event: "check_interval_saved",
+      detail: JSON.stringify({ hours: ci.value }),
+    });
     changed = true;
   }
 
@@ -2305,7 +2347,7 @@ async function handleDriverConfig(store: Store, env: Env): Promise<Response> {
       tg_channels: eff.channels,
       tg_channels_priority_only: eff.priority_only,
       tg_channels_priority_fallback: eff.priority_fallback,
-      check_interval_hours: checkIntervalSeconds(env) / 3600,
+      check_interval_hours: (await effectiveCheckIntervalSeconds(store, env)) / 3600,
       directories,
       quality,
     }),
