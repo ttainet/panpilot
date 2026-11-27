@@ -201,7 +201,7 @@ export interface Env {
   CHECK_INTERVAL_HOURS?: string;
 }
 
-const VERSION = "1.5.0";
+const VERSION = "1.5.1";
 const SESSION_COOKIE = "panpilot_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -1521,6 +1521,17 @@ async function handleDriverProgress(req: Request, store: Store, env: Env, ctx?: 
   if (!input?.task_id) return err("bad_request", "task_id is required", 400);
   const task = await store.getTask(input.task_id);
   if (!task) return err("not_found", "task not found", 404);
+  // Snapshot what is already recorded as stored BEFORE this report is
+  // upserted. The WeCom "new episodes" push (fixed in v1.5.1) may only
+  // fire for episodes that genuinely transition to stored in this
+  // report: drivers routinely re-report the full stored set on
+  // inventory rounds, and without this delta every such round
+  // re-pushed the whole season as if it had just been stored.
+  const prevStored = new Set(
+    (await store.getEpisodes(task.subscription_id))
+      .filter((e) => e.status === "stored")
+      .map((e) => `${e.season}:${e.episode}`),
+  );
   if (input.episodes?.length) await store.upsertEpisodes(task.subscription_id, input.episodes);
   const patch: Partial<Subscription> = {};
   if (input.subscription_status) patch.status = input.subscription_status;
@@ -1547,7 +1558,11 @@ async function handleDriverProgress(req: Request, store: Store, env: Env, ctx?: 
   if (input.subscription_status && ["partial_stored", "completed", "ended", "error"].includes(input.subscription_status)) {
     await store.updateTask(task.id, { status: input.subscription_status === "error" ? "failed" : "done" });
   }
-  const storedEps = (input.episodes ?? []).filter((e) => e.status === "stored");
+  // Only episodes that were not already stored before this report count
+  // as "newly stored" for the WeCom push (see prevStored above).
+  const storedEps = (input.episodes ?? []).filter(
+    (e) => e.status === "stored" && !prevStored.has(`${e.season}:${e.episode}`),
+  );
   const importantStatus = input.subscription_status === "completed"
     || input.subscription_status === "ended"
     || input.subscription_status === "error";
